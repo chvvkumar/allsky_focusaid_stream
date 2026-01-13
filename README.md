@@ -2,6 +2,8 @@
 
 A lightweight, headless Python solution to stream near real-time video from ZWO ASI cameras to a web browser. Designed for Raspberry Pi 5 (running Raspberry Pi OS Bookworm 64-bit) over SSH, with no window manager required.
 
+![Screenshot](screenshot.jpg)
+
 ## Features
 * **Web-based View:** View the camera feed on any device (phone/laptop) via `http://<PI_IP>:5000`.
 * **Headless:** Runs entirely via terminal/SSH; no HDMI monitor or X11/Wayland desktop needed.
