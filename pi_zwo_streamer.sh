@@ -235,7 +235,7 @@ HTML_TEMPLATE = """
     </div>
 
     <div id="ui-layer">
-        <button id="toggle-btn" onclick="toggleUI()">⚙️ Settings</button>
+        <button id="toggle-btn" onclick="toggleUI()">Settings</button>
 
         <div class="controls" id="control-panel">
             <div class="panel-header">
