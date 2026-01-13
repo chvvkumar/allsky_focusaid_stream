@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer - Automated Setup & Launcher
+# ZWO ASI Camera Streamer v3 (Floating UI + Extended Controls)
 # ==============================================================================
 
 GREEN='\033[0;32m'
@@ -9,11 +9,10 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (Floating UI Edition)...${NC}"
 
 # --- 1. System Dependencies Check ---
 echo -e "\n${YELLOW}[Step 1] Checking system dependencies...${NC}"
-# We need these for the camera to communicate via USB properly on Linux
 if ! dpkg -s libopencv-dev >/dev/null 2>&1; then
     echo "Installing system libraries (requires sudo)..."
     sudo apt update
@@ -26,44 +25,22 @@ fi
 echo -e "\n${YELLOW}[Step 2] Configuring Python Virtual Environment...${NC}"
 
 VENV_DIR="venv"
-CREATE_VENV=false
 
-# Check if we are already inside a venv
 if [[ "$VIRTUAL_ENV" != "" ]]; then
-    echo -e "You are already inside a virtual environment: $VIRTUAL_ENV"
-    read -p "Do you want to use this existing environment? (y/n): " use_existing
-    if [[ "$use_existing" != "y" ]]; then
-        echo -e "${RED}Please deactivate your current venv and run this script again.${NC}"
-        exit 1
-    fi
+    echo -e "Using active virtual environment: $VIRTUAL_ENV"
 else
-    # We are not in a venv, check if directory exists
     if [ -d "$VENV_DIR" ]; then
-        echo "Found existing '$VENV_DIR' directory."
-        read -p "Do you want to use it? (y/n): " use_dir
-        if [[ "$use_dir" == "y" ]]; then
-            source "$VENV_DIR/bin/activate"
-        else
-            echo "Please remove the existing '$VENV_DIR' folder or choose a different location."
-            exit 1
-        fi
+        echo "Found existing '$VENV_DIR'. Activating..."
+        source "$VENV_DIR/bin/activate"
     else
-        read -p "Create a new virtual environment ('venv')? (y/n): " create_new
-        if [[ "$create_new" == "y" ]]; then
-            python3 -m venv "$VENV_DIR"
-            source "$VENV_DIR/bin/activate"
-            echo "Virtual environment created and activated."
-        else
-            echo -e "${RED}Warning: Running without a virtual environment on Pi 5 (Bookworm) may fail due to PEP 668.${NC}"
-            read -p "Continue anyway? (y/n): " cont_anyway
-            if [[ "$cont_anyway" != "y" ]]; then exit 1; fi
-        fi
+        echo "Creating new virtual environment..."
+        python3 -m venv "$VENV_DIR"
+        source "$VENV_DIR/bin/activate"
     fi
 fi
 
 # --- 3. Install Python Dependencies ---
 echo -e "\n${YELLOW}[Step 3] Installing Python libraries...${NC}"
-# Upgrade pip first to avoid wheel build issues
 pip install --upgrade pip
 pip install zwoasi flask opencv-python-headless
 
@@ -74,150 +51,377 @@ LIB_FILE="libASICamera2.so"
 if [ ! -f "$LIB_FILE" ]; then
     echo -e "${RED}MISSING: $LIB_FILE${NC}"
     echo "----------------------------------------------------------------"
-    echo "The Python script requires the ZWO C library to talk to the hardware."
-    echo "I cannot download this automatically reliably as the URL changes."
-    echo ""
     echo "ACTION REQUIRED:"
-    echo "1. Go to: https://astronomy-imaging-camera.com/software-drivers"
-    echo "2. Download the 'ASI SDK for Linux'."
-    echo "3. Extract it and find 'libASICamera2.so' inside the 'lib/armv8' folder."
-    echo "4. Copy that file into this folder: $(pwd)"
+    echo "1. Download 'ASI SDK for Linux' from ZWO website."
+    echo "2. Copy 'lib/armv8/libASICamera2.so' into this folder: $(pwd)"
     echo "----------------------------------------------------------------"
-    read -p "Have you placed the .so file in this folder now? (y/n): " file_ready
-    if [[ "$file_ready" != "y" ]]; then
-        echo "Exiting. Please get the file and run this script again."
-        exit 1
-    fi
+    read -p "Have you placed the .so file here? (y/n): " file_ready
+    if [[ "$file_ready" != "y" ]]; then exit 1; fi
 else
     echo -e "${GREEN}Found $LIB_FILE.${NC}"
 fi
 
-# --- 5. Generate Python Script ---
-echo -e "\n${YELLOW}[Step 5] Generating 'zwo.py'...${NC}"
+# --- 5. Generate Advanced Python Script ---
+echo -e "\n${YELLOW}[Step 5] Generating 'zwo.py' with Floating Controls...${NC}"
 
 cat << 'EOF' > zwo.py
 #!/usr/bin/env python3
 import sys
 import os
+import time
+import threading
+import json
 
-# --- Safety Check for Dependencies ---
 try:
     import cv2
     import zwoasi as asi
-    import time
-    from flask import Flask, Response
+    from flask import Flask, Response, render_template_string, request, jsonify
 except ImportError as e:
-    print("\nCRITICAL ERROR: Missing Python Libraries")
-    print(f"Details: {e}")
+    print(f"Missing libraries: {e}")
     sys.exit(1)
-# -------------------------------------
 
 # ================= CONFIGURATION =================
 LIB_FILE = './libASICamera2.so' 
 
-# Camera Settings (Adjust these for your lighting)
-GAIN = 300
-EXPOSURE_US = 20000  # 20ms
-# =================================================
+# Global State for Camera Settings
+cam_state = {
+    'gain': 300,
+    'exposure_ms': 100,   
+    'scale_percent': 50,  
+    'flip': False
+}
+state_lock = threading.Lock()
 
 app = Flask(__name__)
 
+# ================= HTML TEMPLATE =================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ZWO Live View</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: #000; 
+            margin: 0; 
+            padding: 0; 
+            overflow: hidden; /* Prevent scrolling */
+        }
+        
+        /* Full Screen Video */
+        #video-container { 
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: flex; 
+            align-items: center; 
+            justify-content: center;
+            z-index: 1;
+        }
+        img { 
+            width: 100%; 
+            height: 100%; 
+            object-fit: contain; /* Keep aspect ratio */
+        }
+        
+        /* Floating UI Layer */
+        #ui-layer {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            z-index: 100;
+            width: 300px;
+            max-width: 90vw;
+        }
+
+        /* Toggle Button (Visible when minimized) */
+        #toggle-btn {
+            background: rgba(211, 47, 47, 0.9);
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            display: none; /* Hidden by default */
+        }
+
+        /* Control Panel */
+        .controls { 
+            background: rgba(20, 20, 20, 0.85);
+            backdrop-filter: blur(8px);
+            padding: 15px; 
+            border-radius: 12px; 
+            color: #eee;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            border: 1px solid rgba(255,255,255,0.1);
+            transition: opacity 0.3s ease;
+        }
+
+        /* Header with Minimize */
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            padding-bottom: 10px;
+        }
+        .panel-title { font-weight: bold; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; color: #aaa; }
+        .close-btn { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; padding: 0 5px; }
+
+        /* Sliders */
+        .control-group { margin-bottom: 15px; }
+        label { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px; color: #ccc; }
+        .val-display { color: #d32f2f; font-weight: bold; font-family: monospace; }
+        
+        input[type=range] { 
+            width: 100%; 
+            height: 6px; 
+            background: #444; 
+            border-radius: 3px; 
+            outline: none; 
+            -webkit-appearance: none;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px; height: 18px;
+            background: #d32f2f;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+
+        /* Resolution Grid */
+        .res-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; }
+        .res-btn { 
+            padding: 8px 0; font-size: 11px; border: none; border-radius: 4px; 
+            background: #333; color: #aaa; cursor: pointer; 
+        }
+        .res-btn.active { background: #d32f2f; color: white; font-weight: bold; }
+
+    </style>
+</head>
+<body>
+
+    <!-- Video Background -->
+    <div id="video-container">
+        <img src="/video_feed" alt="Waiting for stream...">
+    </div>
+
+    <!-- Floating Interface -->
+    <div id="ui-layer">
+        
+        <button id="toggle-btn" onclick="toggleUI()">⚙️ Settings</button>
+
+        <div class="controls" id="control-panel">
+            <div class="panel-header">
+                <span class="panel-title">ZWO Control</span>
+                <button class="close-btn" onclick="toggleUI()">&times;</button>
+            </div>
+            
+            <!-- Resolution -->
+            <div class="control-group">
+                <label>Scale / Bandwidth</label>
+                <div class="res-grid">
+                    <button onclick="setScale(100)" id="btn-100" class="res-btn">100%</button>
+                    <button onclick="setScale(75)" id="btn-75" class="res-btn">75%</button>
+                    <button onclick="setScale(50)" id="btn-50" class="res-btn">50%</button>
+                    <button onclick="setScale(25)" id="btn-25" class="res-btn">25%</button>
+                    <button onclick="setScale(10)" id="btn-10" class="res-btn">10%</button>
+                </div>
+            </div>
+
+            <!-- Gain Slider -->
+            <div class="control-group">
+                <label>Gain <span id="val-gain" class="val-display">300</span></label>
+                <input type="range" id="rng-gain" min="0" max="600" value="300" 
+                       oninput="updateUI('gain', this.value)" onchange="sendSettings()">
+            </div>
+
+            <!-- Exposure Slider (Up to 5s) -->
+            <div class="control-group">
+                <label>Exposure (ms) <span id="val-exp" class="val-display">100</span></label>
+                <input type="range" id="rng-exp" min="1" max="5000" step="10" value="100" 
+                       oninput="updateUI('exp', this.value)" onchange="sendSettings()">
+            </div>
+            
+            <div style="font-size: 10px; color: #666; text-align: center; margin-top: 10px;">
+                Note: Long exposures >1000ms will lower framerate significantly.
+            </div>
+
+        </div>
+    </div>
+
+    <script>
+        // Default State
+        let currentSettings = { gain: 300, exposure_ms: 100, scale_percent: 50 };
+        let uiVisible = true;
+
+        function toggleUI() {
+            uiVisible = !uiVisible;
+            const panel = document.getElementById('control-panel');
+            const btn = document.getElementById('toggle-btn');
+            
+            if (uiVisible) {
+                panel.style.display = 'block';
+                btn.style.display = 'none';
+            } else {
+                panel.style.display = 'none';
+                btn.style.display = 'block';
+            }
+        }
+
+        function updateUI(key, val) {
+            document.getElementById('val-' + key).innerText = val;
+            if(key === 'gain') currentSettings.gain = parseInt(val);
+            if(key === 'exp') currentSettings.exposure_ms = parseInt(val);
+        }
+
+        function setScale(percent) {
+            currentSettings.scale_percent = percent;
+            
+            // Highlight active button
+            document.querySelectorAll('.res-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById('btn-' + percent).classList.add('active');
+            
+            sendSettings();
+        }
+
+        function sendSettings() {
+            fetch('/update_settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(currentSettings)
+            });
+        }
+
+        // Init UI
+        document.getElementById('btn-50').classList.add('active');
+    </script>
+</body>
+</html>
+"""
+
+# ================= CAMERA LOGIC =================
+
 def get_camera():
-    """Initializes the ZWO camera."""
-    # Ensure absolute path to lib to avoid confusion
     lib_path = os.path.abspath(LIB_FILE)
-    
     try:
-        # Initialize the ZWO library
         asi.init(lib_path)
     except Exception as e:
-        print(f"Error initializing library: {e}")
-        print(f"Checked path: {lib_path}")
+        print(f"Lib Error: {e}")
         return None
 
-    num_cameras = asi.get_num_cameras()
-    if num_cameras == 0:
-        print("No cameras found")
+    if asi.get_num_cameras() == 0:
         return None
 
     try:
-        # Open the first camera found
-        camera = asi.Camera(0)
-        camera_info = camera.get_camera_property()
-        print(f"Connected to: {camera_info['Name']}")
-
-        # Apply settings
-        camera.set_control_value(asi.ASI_GAIN, GAIN)
-        camera.set_control_value(asi.ASI_EXPOSURE, EXPOSURE_US)
-        camera.set_control_value(asi.ASI_BANDWIDTHOVERLOAD, 40) 
-        
+        c = asi.Camera(0)
+        c.set_control_value(asi.ASI_BANDWIDTHOVERLOAD, 40)
         try:
-            camera.set_control_value(asi.ASI_HIGH_SPEED_MODE, 1)
+            c.set_control_value(asi.ASI_HIGH_SPEED_MODE, 1)
         except:
             pass
-
-        camera.start_video_capture()
-        return camera, camera_info
-        
-    except Exception as e:
-        print(f"Error connecting to camera: {e}")
+        c.start_video_capture()
+        return c
+    except:
         return None
 
-def generate_frames(camera, cam_info):
-    """Generator function that yields MJPEG frames."""
-    try:
-        while True:
-            frame = camera.capture_video_frame()
-            
-            if cam_info['IsColorCam']:
-                image = cv2.cvtColor(frame, cv2.COLOR_BAYER_RG2RGB)
-            else:
-                image = frame
+def generate_frames():
+    camera = get_camera()
+    if not camera:
+        yield b"Error: No Camera"
+        return
 
-            ret, buffer = cv2.imencode('.jpg', image)
-            if not ret:
-                continue
-            
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                   
-    except Exception as e:
-        print(f"Stream error: {e}")
-    finally:
+    cam_info = camera.get_camera_property()
+    
+    applied_gain = -1
+    applied_exp = -1
+
+    while True:
+        # 1. READ SETTINGS (Thread Safe)
+        with state_lock:
+            target_gain = cam_state['gain']
+            target_exp_ms = cam_state['exposure_ms']
+            scale = cam_state['scale_percent'] / 100.0
+        
+        # 2. APPLY HARDWARE SETTINGS (Only if changed)
         try:
-            camera.stop_video_capture()
-            camera.close()
-        except:
-            pass
+            if target_gain != applied_gain:
+                camera.set_control_value(asi.ASI_GAIN, target_gain)
+                applied_gain = target_gain
+            
+            if target_exp_ms != applied_exp:
+                # Convert ms to us
+                exp_us = target_exp_ms * 1000 
+                camera.set_control_value(asi.ASI_EXPOSURE, exp_us)
+                applied_exp = target_exp_ms
+        except Exception as e:
+            print(f"Control Error: {e}")
+
+        # 3. CAPTURE
+        try:
+            # Note: For exposures > 2s, this will block for the duration of the exposure
+            frame = camera.capture_video_frame(timeout=target_exp_ms + 500)
+        except Exception as e:
+            # Timeout or droppage
+            # print(f"Capture warning: {e}")
+            time.sleep(0.1)
+            continue
+
+        # 4. PROCESS IMAGE
+        if cam_info['IsColorCam']:
+            image = cv2.cvtColor(frame, cv2.COLOR_BAYER_RG2RGB)
+        else:
+            image = frame
+
+        # Resize based on UI selection
+        if scale != 1.0:
+            width = int(image.shape[1] * scale)
+            height = int(image.shape[0] * scale)
+            # Use INTER_NEAREST for speed on Pi if very small, otherwise LINEAR
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
+
+        # Encode
+        ret, buffer = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ret: continue
+
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+# ================= WEB ROUTES =================
 
 @app.route('/')
 def index():
-    return Response(stream_loader(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return render_template_string(HTML_TEMPLATE)
 
-def stream_loader():
-    cam_data = get_camera()
-    if cam_data:
-        camera, cam_info = cam_data
-        return generate_frames(camera, cam_info)
-    else:
-        return b"Error: Camera not found. Check terminal."
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/update_settings', methods=['POST'])
+def update_settings():
+    data = request.json
+    with state_lock:
+        if 'gain' in data: cam_state['gain'] = int(data['gain'])
+        if 'exposure_ms' in data: cam_state['exposure_ms'] = int(data['exposure_ms'])
+        if 'scale_percent' in data: cam_state['scale_percent'] = int(data['scale_percent'])
+    return jsonify({"status": "ok", "received": data})
 
 if __name__ == '__main__':
     print("\n------------------------------------------------")
-    print(" STREAM STARTED")
+    print(" ZWO WEB CONTROLLER STARTED")
     print("------------------------------------------------")
-    print(" Access the stream at: http://<YOUR_PI_IP>:5000")
-    print(" Press Ctrl+C to stop.")
+    print(" Control Panel: http://<YOUR_PI_IP>:5000")
     print("------------------------------------------------\n")
-    try:
-        app.run(host='0.0.0.0', port=5000, threaded=True)
-    except KeyboardInterrupt:
-        print("Stopping...")
+    app.run(host='0.0.0.0', port=5000, threaded=True)
 EOF
 
 chmod +x zwo.py
-echo "Script 'zwo.py' created successfully."
+echo "Advanced script 'zwo.py' created."
 
 # --- 6. Launch ---
 echo -e "\n${GREEN}[Step 6] Launching Camera Stream...${NC}"
