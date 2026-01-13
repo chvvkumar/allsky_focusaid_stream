@@ -25,7 +25,7 @@ cd ~/allsky_focusaid_stream
 ```
 
 ### 2. Copy the ZWO Library
-This script requires the compiled C library `libASICamera2.so` to communicate with ZWO cameras. You must extract the ZWO SDK and copy the ARMv8 library to this folder.
+This script requires the compiled C library `libASICamera2.so` to communicate with ZWO cameras. You must extract the ZWO SDK and copy the appropriate ARMvX library to this folder based on the Pi you have. The repo has the ARMv8 version included that are suitable for Pi4 and 5.
 
 ZWO SDK URL: https://dl.zwoastro.com/software?app=DeveloperCameraSdk&platform=windows86&region=Overseas
 
