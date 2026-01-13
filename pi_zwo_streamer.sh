@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer v3 (Floating UI + Extended Controls)
+# ZWO ASI Camera Streamer v4 (Microsecond Precision + Floating UI)
 # ==============================================================================
 
 GREEN='\033[0;32m'
@@ -9,7 +9,7 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (Floating UI Edition)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (Precision Edition)...${NC}"
 
 # --- 1. System Dependencies Check ---
 echo -e "\n${YELLOW}[Step 1] Checking system dependencies...${NC}"
@@ -62,7 +62,7 @@ else
 fi
 
 # --- 5. Generate Advanced Python Script ---
-echo -e "\n${YELLOW}[Step 5] Generating 'zwo.py' with Floating Controls...${NC}"
+echo -e "\n${YELLOW}[Step 5] Generating 'zwo.py' with Microsecond Controls...${NC}"
 
 cat << 'EOF' > zwo.py
 #!/usr/bin/env python3
@@ -86,7 +86,8 @@ LIB_FILE = './libASICamera2.so'
 # Global State for Camera Settings
 cam_state = {
     'gain': 300,
-    'exposure_ms': 100,   
+    'exposure_val': 100,  # Value for the slider
+    'exposure_mode': 'ms', # 'ms' or 'us'
     'scale_percent': 50,  
     'flip': False
 }
@@ -122,7 +123,7 @@ HTML_TEMPLATE = """
         img { 
             width: 100%; 
             height: 100%; 
-            object-fit: contain; /* Keep aspect ratio */
+            object-fit: contain; 
         }
         
         /* Floating UI Layer */
@@ -131,8 +132,8 @@ HTML_TEMPLATE = """
             top: 10px;
             left: 10px;
             z-index: 100;
-            width: 300px;
-            max-width: 90vw;
+            width: 320px;
+            max-width: 95vw;
         }
 
         /* Toggle Button (Visible when minimized) */
@@ -145,7 +146,7 @@ HTML_TEMPLATE = """
             font-weight: bold;
             cursor: pointer;
             box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-            display: none; /* Hidden by default */
+            display: none;
         }
 
         /* Control Panel */
@@ -160,7 +161,7 @@ HTML_TEMPLATE = """
             transition: opacity 0.3s ease;
         }
 
-        /* Header with Minimize */
+        /* Header */
         .panel-header {
             display: flex;
             justify-content: space-between;
@@ -170,9 +171,9 @@ HTML_TEMPLATE = """
             padding-bottom: 10px;
         }
         .panel-title { font-weight: bold; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; color: #aaa; }
-        .close-btn { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; padding: 0 5px; }
+        .close-btn { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; }
 
-        /* Sliders */
+        /* General Inputs */
         .control-group { margin-bottom: 15px; }
         label { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px; color: #ccc; }
         .val-display { color: #d32f2f; font-weight: bold; font-family: monospace; }
@@ -193,6 +194,30 @@ HTML_TEMPLATE = """
             cursor: pointer;
         }
 
+        /* Mode Toggles */
+        .mode-toggle {
+            display: flex;
+            background: #333;
+            border-radius: 6px;
+            padding: 2px;
+            margin-bottom: 10px;
+        }
+        .mode-btn {
+            flex: 1;
+            padding: 6px;
+            border: none;
+            background: transparent;
+            color: #888;
+            font-size: 12px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        .mode-btn.active {
+            background: #555;
+            color: white;
+            font-weight: bold;
+        }
+
         /* Resolution Grid */
         .res-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; }
         .res-btn { 
@@ -205,14 +230,11 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
-    <!-- Video Background -->
     <div id="video-container">
         <img src="/video_feed" alt="Waiting for stream...">
     </div>
 
-    <!-- Floating Interface -->
     <div id="ui-layer">
-        
         <button id="toggle-btn" onclick="toggleUI()">⚙️ Settings</button>
 
         <div class="controls" id="control-panel">
@@ -223,7 +245,7 @@ HTML_TEMPLATE = """
             
             <!-- Resolution -->
             <div class="control-group">
-                <label>Scale / Bandwidth</label>
+                <label>Resolution</label>
                 <div class="res-grid">
                     <button onclick="setScale(100)" id="btn-100" class="res-btn">100%</button>
                     <button onclick="setScale(75)" id="btn-75" class="res-btn">75%</button>
@@ -233,59 +255,83 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Gain Slider -->
+            <!-- Gain -->
             <div class="control-group">
                 <label>Gain <span id="val-gain" class="val-display">300</span></label>
                 <input type="range" id="rng-gain" min="0" max="600" value="300" 
                        oninput="updateUI('gain', this.value)" onchange="sendSettings()">
             </div>
 
-            <!-- Exposure Slider (Up to 5s) -->
+            <!-- Exposure -->
             <div class="control-group">
-                <label>Exposure (ms) <span id="val-exp" class="val-display">100</span></label>
-                <input type="range" id="rng-exp" min="1" max="5000" step="10" value="100" 
+                <label>Exposure Time <span id="val-exp" class="val-display">100 ms</span></label>
+                
+                <!-- Unit Toggle -->
+                <div class="mode-toggle">
+                    <button class="mode-btn active" id="mode-ms" onclick="setExpMode('ms')">Milliseconds (Standard)</button>
+                    <button class="mode-btn" id="mode-us" onclick="setExpMode('us')">Microseconds (Fast)</button>
+                </div>
+
+                <input type="range" id="rng-exp" min="1" max="5000" step="1" value="100" 
                        oninput="updateUI('exp', this.value)" onchange="sendSettings()">
             </div>
             
-            <div style="font-size: 10px; color: #666; text-align: center; margin-top: 10px;">
-                Note: Long exposures >1000ms will lower framerate significantly.
-            </div>
-
         </div>
     </div>
 
     <script>
-        // Default State
-        let currentSettings = { gain: 300, exposure_ms: 100, scale_percent: 50 };
+        // State
+        let currentSettings = { gain: 300, exposure_val: 100, exposure_mode: 'ms', scale_percent: 50 };
         let uiVisible = true;
 
         function toggleUI() {
             uiVisible = !uiVisible;
-            const panel = document.getElementById('control-panel');
-            const btn = document.getElementById('toggle-btn');
-            
-            if (uiVisible) {
-                panel.style.display = 'block';
-                btn.style.display = 'none';
-            } else {
-                panel.style.display = 'none';
-                btn.style.display = 'block';
-            }
+            document.getElementById('control-panel').style.display = uiVisible ? 'block' : 'none';
+            document.getElementById('toggle-btn').style.display = uiVisible ? 'none' : 'block';
         }
 
         function updateUI(key, val) {
-            document.getElementById('val-' + key).innerText = val;
-            if(key === 'gain') currentSettings.gain = parseInt(val);
-            if(key === 'exp') currentSettings.exposure_ms = parseInt(val);
+            if(key === 'gain') {
+                document.getElementById('val-gain').innerText = val;
+                currentSettings.gain = parseInt(val);
+            }
+            if(key === 'exp') {
+                document.getElementById('val-exp').innerText = val + ' ' + currentSettings.exposure_mode;
+                currentSettings.exposure_val = parseInt(val);
+            }
+        }
+
+        function setExpMode(mode) {
+            currentSettings.exposure_mode = mode;
+            
+            const slider = document.getElementById('rng-exp');
+            const btnMs = document.getElementById('mode-ms');
+            const btnUs = document.getElementById('mode-us');
+
+            if(mode === 'ms') {
+                // Standard Range: 1ms to 5000ms
+                slider.min = 1; 
+                slider.max = 5000;
+                slider.value = 100; // Reset to safe default
+                btnMs.classList.add('active');
+                btnUs.classList.remove('active');
+            } else {
+                // Microsecond Range: 1us to 1000us
+                slider.min = 1;
+                slider.max = 1000;
+                slider.value = 500;
+                btnMs.classList.remove('active');
+                btnUs.classList.add('active');
+            }
+            
+            updateUI('exp', slider.value);
+            sendSettings();
         }
 
         function setScale(percent) {
             currentSettings.scale_percent = percent;
-            
-            // Highlight active button
             document.querySelectorAll('.res-btn').forEach(b => b.classList.remove('active'));
             document.getElementById('btn-' + percent).classList.add('active');
-            
             sendSettings();
         }
 
@@ -297,7 +343,7 @@ HTML_TEMPLATE = """
             });
         }
 
-        // Init UI
+        // Init
         document.getElementById('btn-50').classList.add('active');
     </script>
 </body>
@@ -341,34 +387,39 @@ def generate_frames():
     applied_exp = -1
 
     while True:
-        # 1. READ SETTINGS (Thread Safe)
+        # 1. READ SETTINGS
         with state_lock:
             target_gain = cam_state['gain']
-            target_exp_ms = cam_state['exposure_ms']
+            exp_val = cam_state['exposure_val']
+            exp_mode = cam_state['exposure_mode']
             scale = cam_state['scale_percent'] / 100.0
         
-        # 2. APPLY HARDWARE SETTINGS (Only if changed)
+        # Calculate Microseconds
+        if exp_mode == 'ms':
+            target_exp_us = exp_val * 1000
+        else:
+            target_exp_us = exp_val  # Direct Microseconds (1-1000)
+
+        # 2. APPLY HARDWARE SETTINGS
         try:
             if target_gain != applied_gain:
                 camera.set_control_value(asi.ASI_GAIN, target_gain)
                 applied_gain = target_gain
             
-            if target_exp_ms != applied_exp:
-                # Convert ms to us
-                exp_us = target_exp_ms * 1000 
-                camera.set_control_value(asi.ASI_EXPOSURE, exp_us)
-                applied_exp = target_exp_ms
+            if target_exp_us != applied_exp:
+                camera.set_control_value(asi.ASI_EXPOSURE, target_exp_us)
+                applied_exp = target_exp_us
         except Exception as e:
             print(f"Control Error: {e}")
 
         # 3. CAPTURE
         try:
-            # Note: For exposures > 2s, this will block for the duration of the exposure
-            frame = camera.capture_video_frame(timeout=target_exp_ms + 500)
+            # Calculate safe timeout in MS
+            # Exposure (us) / 1000 = ms. Add 500ms buffer.
+            timeout_ms = int((target_exp_us / 1000) + 500)
+            frame = camera.capture_video_frame(timeout=timeout_ms)
         except Exception as e:
-            # Timeout or droppage
-            # print(f"Capture warning: {e}")
-            time.sleep(0.1)
+            time.sleep(0.01)
             continue
 
         # 4. PROCESS IMAGE
@@ -377,14 +428,11 @@ def generate_frames():
         else:
             image = frame
 
-        # Resize based on UI selection
         if scale != 1.0:
             width = int(image.shape[1] * scale)
             height = int(image.shape[0] * scale)
-            # Use INTER_NEAREST for speed on Pi if very small, otherwise LINEAR
             image = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
 
-        # Encode
         ret, buffer = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if not ret: continue
 
@@ -407,7 +455,8 @@ def update_settings():
     data = request.json
     with state_lock:
         if 'gain' in data: cam_state['gain'] = int(data['gain'])
-        if 'exposure_ms' in data: cam_state['exposure_ms'] = int(data['exposure_ms'])
+        if 'exposure_val' in data: cam_state['exposure_val'] = int(data['exposure_val'])
+        if 'exposure_mode' in data: cam_state['exposure_mode'] = str(data['exposure_mode'])
         if 'scale_percent' in data: cam_state['scale_percent'] = int(data['scale_percent'])
     return jsonify({"status": "ok", "received": data})
 
