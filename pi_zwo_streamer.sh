@@ -235,7 +235,7 @@ HTML_TEMPLATE = """
 
             <div class="control-group">
                 <label>Digital Zoom <span id="val-zoom" class="val-display">1.0x</span></label>
-                <input type="range" id="rng-zoom" min="10" max="40" value="10" 
+                <input type="range" id="rng-zoom" min="10" max="100" value="10" 
                        oninput="updateZoom(this.value)">
             </div>
 
