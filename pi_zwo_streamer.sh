@@ -96,6 +96,10 @@ cam_state = {
 }
 state_lock = threading.Lock()
 
+# Global Camera
+camera = None
+camera_lock = threading.Lock()
+
 app = Flask(__name__)
 
 # ================= HTML TEMPLATE =================
@@ -564,21 +568,41 @@ def calculate_fwhm(roi_img):
     except:
         return 0.0
 
-def generate_frames():
-    lib_path = os.path.abspath(LIB_FILE)
-    try:
-        asi.init(lib_path)
-    except:
-        pass
-        
-    if asi.get_num_cameras() == 0:
-        yield b"Error: No Camera Found"
-        return
+def init_camera():
+    global camera
+    with camera_lock:
+        if camera is not None:
+            return True
+            
+        lib_path = os.path.abspath(LIB_FILE)
+        try:
+            asi.init(lib_path)
+        except Exception as e:
+            print(f"ASI Init: {e}")
+            return False
+            
+        if asi.get_num_cameras() == 0:
+            print("No cameras detected")
+            return False
 
-    camera = asi.Camera(0)
-    camera.set_control_value(asi.ASI_BANDWIDTHOVERLOAD, 40)
-    camera.set_control_value(asi.ASI_HIGH_SPEED_MODE, 1)
-    camera.start_video_capture()
+        camera = asi.Camera(0)
+        try:
+            camera.set_control_value(asi.ASI_BANDWIDTHOVERLOAD, 40)
+            camera.set_control_value(asi.ASI_HIGH_SPEED_MODE, 1)
+            camera.start_video_capture()
+            print(f"Camera initialized: {camera.get_camera_property()['Name']}")
+            return True
+        except Exception as e:
+            print(f"Camera setup error: {e}")
+            camera = None
+            return False
+
+def generate_frames():
+    global camera
+    
+    if not init_camera():
+        yield b"Error: Camera initialization failed"
+        return
 
     applied_gain = -1
     applied_exp = -1
