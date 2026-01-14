@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer v5 (Touch ROI + FWHM Metrics)
+# ZWO ASI Camera Streamer v6 (Zoom, Daylight Mode, Configurable Text)
 # ==============================================================================
 
 GREEN='\033[0;32m'
@@ -9,7 +9,7 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (Focus Aid Edition)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (Zoom Edition)...${NC}"
 
 # --- 1. System Dependencies Check ---
 echo -e "\n${YELLOW}[Step 1] Checking system dependencies...${NC}"
@@ -42,7 +42,6 @@ fi
 # --- 3. Install Python Dependencies ---
 echo -e "\n${YELLOW}[Step 3] Installing Python libraries...${NC}"
 pip install --upgrade pip
-# numpy is usually pulled in by opencv-python-headless, but we ensure it here
 pip install zwoasi flask opencv-python-headless numpy
 
 # --- 4. Check for ZWO SDK Library (.so file) ---
@@ -63,7 +62,7 @@ else
 fi
 
 # --- 5. Generate Advanced Python Script ---
-echo -e "\n${YELLOW}[Step 5] Generating 'zwo.py' with Touch ROI & FWHM...${NC}"
+echo -e "\n${YELLOW}[Step 5] Generating 'zwo.py' with Zoom & Daylight Support...${NC}"
 
 cat << 'EOF' > zwo.py
 #!/usr/bin/env python3
@@ -92,7 +91,8 @@ cam_state = {
     'exposure_val': 100,
     'exposure_mode': 'ms',
     'scale_percent': 50,
-    'roi_norm': None  # format: {'x':0.1, 'y':0.1, 'w':0.2, 'h':0.2} (Normalized 0.0-1.0)
+    'font_scale': 1.0,  # New: Text Size
+    'roi_norm': None
 }
 state_lock = threading.Lock()
 
@@ -112,65 +112,75 @@ HTML_TEMPLATE = """
             margin: 0; 
             padding: 0; 
             overflow: hidden; 
-            touch-action: none; /* Disable browser zooming/scrolling */
+            touch-action: none; 
         }
         
-        /* Container ensuring proper layering */
+        /* Viewport limits what we see */
         #viewport {
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
             display: flex;
             align-items: center;
             justify-content: center;
-            background: #000;
+            background: #111;
+            overflow: hidden;
         }
 
-        /* The Camera Feed */
+        /* The container that gets Transformed (Zoom/Pan) */
+        #transform-layer {
+            position: relative;
+            transform-origin: center center;
+            transition: transform 0.1s ease-out;
+            will-change: transform;
+        }
+
+        /* The Video Feed */
         #video-feed { 
-            max-width: 100%; 
-            max-height: 100%; 
-            object-fit: contain; /* Crucial: maintains aspect ratio */
-            user-select: none;
-            -webkit-user-select: none;
+            display: block;
+            max-width: 100vw; 
+            max-height: 100vh; 
+            object-fit: contain;
+            pointer-events: none; /* Let clicks pass to interaction layer */
         }
         
-        /* The Selection Overlay Canvas */
+        /* The Interaction Layer (Captures Clicks/Drags) */
         #interaction-layer {
             position: absolute;
             top: 0; left: 0; right: 0; bottom: 0;
             z-index: 10;
-            cursor: crosshair;
         }
 
-        /* Selection Box (Visual only during drag) */
+        /* Selection Box */
         #selection-box {
-            position: fixed;
-            border: 2px dashed rgba(255, 0, 0, 0.8);
-            background: rgba(255, 0, 0, 0.1);
+            position: absolute;
+            border: 2px dashed rgba(255, 0, 0, 0.9);
+            background: rgba(255, 0, 0, 0.2);
             display: none;
-            pointer-events: none; /* Let clicks pass through */
             z-index: 20;
+            pointer-events: none;
         }
 
-        /* UI Controls Layer */
+        /* UI Layer */
         #ui-layer {
             position: fixed;
             top: 10px; left: 10px;
             z-index: 100;
-            width: 300px;
-            max-width: 90vw;
-            pointer-events: none; /* Let touches pass through to canvas */
+            width: 320px;
+            max-width: 95vw;
+            pointer-events: none; 
         }
 
         .controls { 
-            pointer-events: auto; /* Re-enable clicks for buttons */
+            pointer-events: auto;
             background: rgba(20, 20, 20, 0.85);
             backdrop-filter: blur(8px);
             padding: 15px; 
             border-radius: 12px; 
             color: #eee;
             border: 1px solid rgba(255,255,255,0.1);
-            display: none; /* Hidden by default */
+            display: none;
+            max-height: 80vh;
+            overflow-y: auto;
         }
 
         #toggle-btn {
@@ -180,127 +190,250 @@ HTML_TEMPLATE = """
             border-radius: 20px; font-weight: bold; cursor: pointer;
         }
 
+        /* Mode Switcher */
+        .mode-switch {
+            display: flex; background: #333; border-radius: 6px; margin-bottom: 15px;
+        }
+        .mode-switch button {
+            flex: 1; padding: 8px; border: none; background: transparent; color: #888; cursor: pointer; border-radius: 6px; font-weight: bold;
+        }
+        .mode-switch button.active { background: #d32f2f; color: white; }
+
         /* Form Elements */
         .control-group { margin-bottom: 12px; }
-        label { display: flex; justify-content: space-between; font-size: 13px; color: #ccc; margin-bottom: 5px; }
+        label { display: flex; justify-content: space-between; font-size: 12px; color: #ccc; margin-bottom: 4px; }
         .val-display { color: #d32f2f; font-weight: bold; font-family: monospace; }
+        
         input[type=range] { width: 100%; height: 6px; background: #444; border-radius: 3px; -webkit-appearance: none; }
         input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; background: #d32f2f; border-radius: 50%; }
+
+        .btn-action {
+            width: 100%; padding: 8px; background: #444; color: white; border: none; border-radius: 4px; margin-top: 5px; cursor: pointer;
+        }
+        .btn-action:hover { background: #555; }
+        
+        /* Floating Toolbar for Pan/Select */
+        #toolbar {
+            position: fixed;
+            bottom: 20px; right: 20px;
+            z-index: 101;
+            display: flex;
+            gap: 10px;
+        }
+        .tool-btn {
+            width: 50px; height: 50px; border-radius: 25px; border: none;
+            background: #333; color: #fff; font-size: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            cursor: pointer;
+        }
+        .tool-btn.active { background: #d32f2f; }
 
     </style>
 </head>
 <body>
 
     <div id="viewport">
-        <img id="video-feed" src="/video_feed" draggable="false">
-        <div id="interaction-layer"></div>
+        <div id="transform-layer">
+            <img id="video-feed" src="/video_feed">
+            <div id="interaction-layer">
+                <div id="selection-box"></div>
+            </div>
+        </div>
     </div>
     
-    <div id="selection-box"></div>
+    <div id="toolbar">
+        <button class="tool-btn active" id="btn-select" onclick="setTool('select')" title="Select Star">⛝</button>
+        <button class="tool-btn" id="btn-pan" onclick="setTool('pan')" title="Pan Image">✋</button>
+    </div>
 
     <div id="ui-layer">
         <button id="toggle-btn" onclick="toggleUI()">Settings</button>
+        
         <div class="controls" id="control-panel">
             <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
-                <strong>CAMERA SETTINGS</strong>
+                <strong>CAMERA CONTROLS</strong>
                 <button onclick="toggleUI()" style="background:none; border:none; color:#fff; font-size:18px;">&times;</button>
             </div>
-            
+
+            <div class="control-group">
+                <label>Digital Zoom <span id="val-zoom" class="val-display">1.0x</span></label>
+                <input type="range" id="rng-zoom" min="10" max="40" value="10" 
+                       oninput="updateZoom(this.value)">
+            </div>
+
             <div class="control-group">
                 <label>Gain <span id="val-gain" class="val-display">300</span></label>
                 <input type="range" id="rng-gain" min="0" max="600" value="300" 
                        oninput="updateVal('gain', this.value)" onchange="sendSettings()">
             </div>
 
+            <div class="mode-switch">
+                <button id="mode-ms" class="active" onclick="setExpMode('ms')">Milliseconds</button>
+                <button id="mode-us" onclick="setExpMode('us')">Microseconds</button>
+            </div>
+
             <div class="control-group">
-                <label>Exposure <span id="val-exp" class="val-display">100 ms</span></label>
+                <label>Exposure Time <span id="val-exp" class="val-display">100</span></label>
                 <input type="range" id="rng-exp" min="1" max="5000" value="100" 
                        oninput="updateVal('exp', this.value)" onchange="sendSettings()">
             </div>
+
+            <div class="control-group">
+                <button class="btn-action" onclick="setDaylight()">☀ Daylight Preset (Fast)</button>
+            </div>
+            
+            <hr style="border-color: #333; margin: 15px 0;">
+
+            <div class="control-group">
+                <label>FWHM Text Size <span id="val-font" class="val-display">1.0</span></label>
+                <input type="range" id="rng-font" min="5" max="30" value="10" 
+                       oninput="updateVal('font', this.value)" onchange="sendSettings()">
+            </div>
             
             <div style="font-size: 11px; color: #888; margin-top: 10px;">
-                Double-tap video to clear selection.
+                Double-tap video to clear FWHM box.
             </div>
         </div>
     </div>
 
     <script>
-        const videoImg = document.getElementById('video-feed');
-        const touchLayer = document.getElementById('interaction-layer');
+        const layer = document.getElementById('interaction-layer');
+        const transformLayer = document.getElementById('transform-layer');
         const selBox = document.getElementById('selection-box');
+        
+        // State
+        let currentTool = 'select'; // 'select' or 'pan'
+        let zoomLevel = 1.0;
+        let panX = 0, panY = 0;
         
         let startX, startY;
         let isDragging = false;
         
-        // Touch & Mouse Handlers
-        touchLayer.addEventListener('touchstart', handleStart, {passive: false});
-        touchLayer.addEventListener('mousedown', handleStart);
+        // Event Listeners
+        layer.addEventListener('touchstart', handleStart, {passive: false});
+        layer.addEventListener('mousedown', handleStart);
         
-        touchLayer.addEventListener('touchmove', handleMove, {passive: false});
-        touchLayer.addEventListener('mousemove', handleMove);
+        layer.addEventListener('touchmove', handleMove, {passive: false});
+        layer.addEventListener('mousemove', handleMove);
         
-        touchLayer.addEventListener('touchend', handleEnd);
-        touchLayer.addEventListener('mouseup', handleEnd);
+        layer.addEventListener('touchend', handleEnd);
+        layer.addEventListener('mouseup', handleEnd);
         
-        // Double tap/click to clear
-        touchLayer.addEventListener('dblclick', clearSelection);
-        let lastTap = 0;
-        touchLayer.addEventListener('touchend', function(e) {
-            let currentTime = new Date().getTime();
-            let tapLength = currentTime - lastTap;
-            if (tapLength < 500 && tapLength > 0) {
-                clearSelection();
-                e.preventDefault();
-            }
-            lastTap = currentTime;
-        });
+        layer.addEventListener('dblclick', clearSelection);
+
+        // --- Interaction Logic ---
+        function setTool(t) {
+            currentTool = t;
+            document.getElementById('btn-select').classList.toggle('active', t==='select');
+            document.getElementById('btn-pan').classList.toggle('active', t==='pan');
+            layer.style.cursor = t==='pan' ? 'grab' : 'crosshair';
+        }
+
+        function updateZoom(val) {
+            zoomLevel = val / 10.0;
+            document.getElementById('val-zoom').innerText = zoomLevel.toFixed(1) + 'x';
+            applyTransform();
+        }
+
+        function applyTransform() {
+            transformLayer.style.transform = `scale(${zoomLevel}) translate(${panX}px, ${panY}px)`;
+        }
 
         function handleStart(e) {
-            e.preventDefault(); // Prevent scrolling
+            e.preventDefault();
             const pt = getPoint(e);
             startX = pt.x;
             startY = pt.y;
             isDragging = true;
-            
-            selBox.style.left = startX + 'px';
-            selBox.style.top = startY + 'px';
-            selBox.style.width = '0px';
-            selBox.style.height = '0px';
-            selBox.style.display = 'block';
+
+            if(currentTool === 'select') {
+                // Reset box visual relative to the zoomed layer
+                const rect = layer.getBoundingClientRect(); // Get current zoomed coords
+                
+                // We need click coordinates relative to the LAYER, not the SCREEN
+                // Luckily, layer is child of transform-layer, so offsetX/Y works well with mouse
+                // But touch is trickier.
+                
+                // Simple approach: Calculate relative to client, apply inverse later? 
+                // Actually, standard visual feedback:
+                selBox.style.display = 'block';
+                selBox.style.width = '0px';
+                selBox.style.height = '0px';
+                
+                // We place the box using client coordinates initially for simplicity, 
+                // but since the parent is transformed, we must be careful.
+                // EASIER: Calculate Offset relative to the interaction-layer directly.
+                
+                let local = getLocalCoords(e);
+                selBox.dataset.ox = local.x;
+                selBox.dataset.oy = local.y;
+                selBox.style.left = local.x + 'px';
+                selBox.style.top = local.y + 'px';
+            }
         }
 
         function handleMove(e) {
             if(!isDragging) return;
             e.preventDefault();
             const pt = getPoint(e);
-            
-            const currentX = pt.x;
-            const currentY = pt.y;
-            
-            const width = Math.abs(currentX - startX);
-            const height = Math.abs(currentY - startY);
-            const left = Math.min(currentX, startX);
-            const top = Math.min(currentY, startY);
 
-            selBox.style.width = width + 'px';
-            selBox.style.height = height + 'px';
-            selBox.style.left = left + 'px';
-            selBox.style.top = top + 'px';
+            if(currentTool === 'pan') {
+                const dx = (pt.x - startX) / zoomLevel;
+                const dy = (pt.y - startY) / zoomLevel;
+                panX += dx;
+                panY += dy;
+                startX = pt.x; // reset for next delta
+                startY = pt.y;
+                applyTransform();
+            } else {
+                // Select Mode
+                let local = getLocalCoords(e);
+                let ox = parseFloat(selBox.dataset.ox);
+                let oy = parseFloat(selBox.dataset.oy);
+                
+                let w = Math.abs(local.x - ox);
+                let h = Math.abs(local.y - oy);
+                let l = Math.min(local.x, ox);
+                let t = Math.min(local.y, oy);
+                
+                selBox.style.width = w + 'px';
+                selBox.style.height = h + 'px';
+                selBox.style.left = l + 'px';
+                selBox.style.top = t + 'px';
+            }
         }
 
         function handleEnd(e) {
             if(!isDragging) return;
             isDragging = false;
             
-            // Calculate final geometry
-            const rect = selBox.getBoundingClientRect();
-            selBox.style.display = 'none'; // Hide visual box, let backend draw it
+            if(currentTool === 'select') {
+                const w = parseFloat(selBox.style.width);
+                const h = parseFloat(selBox.style.height);
+                const l = parseFloat(selBox.style.left);
+                const t = parseFloat(selBox.style.top);
+                
+                selBox.style.display = 'none';
+                if(w < 10 || h < 10) return;
 
-            // Minimum size filter (avoid accidental tiny clicks)
-            if(rect.width < 10 || rect.height < 10) return;
+                // Normalize based on the layer size (which matches the image size)
+                // Note: layer.offsetWidth is the un-zoomed internal size, which is what we want!
+                const totalW = layer.offsetWidth;
+                const totalH = layer.offsetHeight;
 
-            // Normalize coordinates relative to the actual displayed image
-            sendROI(rect.left, rect.top, rect.width, rect.height);
+                const roi = {
+                    x: l / totalW,
+                    y: t / totalH,
+                    w: w / totalW,
+                    h: h / totalH
+                };
+                
+                fetch('/update_roi', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(roi)
+                });
+            }
         }
 
         function getPoint(e) {
@@ -308,67 +441,82 @@ HTML_TEMPLATE = """
             return {x: e.clientX, y: e.clientY};
         }
 
-        function sendROI(screenX, screenY, screenW, screenH) {
-            // Get the geometry of the image element itself
-            const imgRect = videoImg.getBoundingClientRect();
+        function getLocalCoords(e) {
+            // Returns coordinates relative to the un-zoomed element space
+            const rect = layer.getBoundingClientRect();
+            const pt = getPoint(e);
             
-            // Note: object-fit: contain creates "black bars" inside the img element.
-            // We need to calculate the *actual* rendered image dimensions.
+            // Map screen pixels to element pixels taking Zoom into account
+            const relX = (pt.x - rect.left) / zoomLevel;
+            const relY = (pt.y - rect.top) / zoomLevel;
             
-            const natW = videoImg.naturalWidth || 1920;
-            const natH = videoImg.naturalHeight || 1080;
-            const dispW = imgRect.width;
-            const dispH = imgRect.height;
-            
-            const natRatio = natW / natH;
-            const dispRatio = dispW / dispH;
-            
-            let renderW, renderH, offsetX, offsetY;
-            
-            if (dispRatio > natRatio) {
-                // Image is pillarboxed (black bars on sides)
-                renderH = dispH;
-                renderW = dispH * natRatio;
-                offsetX = (dispW - renderW) / 2;
-                offsetY = 0;
-            } else {
-                // Image is letterboxed (black bars top/bottom)
-                renderW = dispW;
-                renderH = dispW / natRatio;
-                offsetX = 0;
-                offsetY = (dispH - renderH) / 2;
-            }
-            
-            // Calculate Normalized Coordinates (0.0 to 1.0) relative to the ACTIVE image area
-            // 1. Shift screen coord to be relative to the image element
-            let relX = screenX - imgRect.left;
-            let relY = screenY - imgRect.top;
-            
-            // 2. Subtract the black bar offsets
-            relX -= offsetX;
-            relY -= offsetY;
-            
-            // 3. Normalize
-            const normX = relX / renderW;
-            const normY = relY / renderH;
-            const normW = screenW / renderW;
-            const normH = screenH / renderH;
-            
-            // 4. Clamp (in case drag went outside image)
-            const roi = {
-                x: Math.max(0, Math.min(1, normX)),
-                y: Math.max(0, Math.min(1, normY)),
-                w: Math.min(1 - normX, normW),
-                h: Math.min(1 - normY, normH)
-            };
+            return {x: relX, y: relY};
+        }
+        
+        // --- Settings Logic ---
+        let settings = {gain: 300, exp: 100, font: 10};
+        let expMode = 'ms';
 
-            fetch('/update_roi', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(roi)
-            });
+        function toggleUI() {
+            const p = document.getElementById('control-panel');
+            const b = document.getElementById('toggle-btn');
+            const show = p.style.display === 'none';
+            p.style.display = show ? 'block' : 'none';
+            b.style.display = show ? 'none' : 'block';
         }
 
+        function setExpMode(m) {
+            expMode = m;
+            document.getElementById('mode-ms').classList.toggle('active', m==='ms');
+            document.getElementById('mode-us').classList.toggle('active', m==='us');
+            
+            const rng = document.getElementById('rng-exp');
+            if(m === 'ms') {
+                rng.max = 5000;
+                rng.value = Math.max(1, rng.value); // keep value if valid
+                document.getElementById('val-exp').innerText = rng.value + ' ms';
+            } else {
+                rng.max = 2000; // Allow up to 2000us
+                rng.value = 100; // Reset to safe us value
+                document.getElementById('val-exp').innerText = rng.value + ' µs';
+            }
+            sendSettings();
+        }
+
+        function setDaylight() {
+            setExpMode('us');
+            document.getElementById('rng-exp').value = 100;
+            document.getElementById('rng-gain').value = 0;
+            updateVal('exp', 100);
+            updateVal('gain', 0);
+            sendSettings();
+        }
+
+        function updateVal(k, v) {
+            if(k === 'font') {
+                document.getElementById('val-'+k).innerText = (v/10.0).toFixed(1);
+            } else {
+                document.getElementById('val-'+k).innerText = v + (k==='exp' ? (expMode==='ms'?' ms':' µs') : '');
+            }
+            
+            if(k === 'gain') settings.gain = parseInt(v);
+            if(k === 'exp') settings.exp = parseInt(v);
+            if(k === 'font') settings.font = parseInt(v);
+        }
+
+        function sendSettings() {
+            fetch('/update_settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    gain: settings.gain, 
+                    exposure_val: settings.exp,
+                    exposure_mode: expMode,
+                    font_scale: settings.font / 10.0
+                })
+            });
+        }
+        
         function clearSelection() {
             selBox.style.display = 'none';
             fetch('/update_roi', {
@@ -378,26 +526,7 @@ HTML_TEMPLATE = """
             });
         }
         
-        // Settings Logic
-        let settings = {gain: 300, exp: 100};
-        function toggleUI() {
-            const p = document.getElementById('control-panel');
-            const b = document.getElementById('toggle-btn');
-            const show = p.style.display === 'none';
-            p.style.display = show ? 'block' : 'none';
-            b.style.display = show ? 'none' : 'block';
-        }
-        function updateVal(k, v) {
-            document.getElementById('val-'+k).innerText = v;
-            settings[k] = parseInt(v);
-        }
-        function sendSettings() {
-            fetch('/update_settings', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({gain: settings.gain, exposure_val: settings.exp})
-            });
-        }
+        // Init
         document.getElementById('control-panel').style.display = 'none';
     </script>
 </body>
@@ -407,66 +536,35 @@ HTML_TEMPLATE = """
 # ================= IMAGE PROCESSING =================
 
 def calculate_fwhm(roi_img):
-    """
-    Calculates FWHM of the brightest star in the ROI.
-    Uses Standard Deviation of pixel distribution.
-    FWHM = 2.355 * sigma
-    """
     try:
-        # 1. Basic Stats
         minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(roi_img)
-        
-        # Noise floor heuristic: max - (max-min)*0.5
         threshold_val = maxVal - (maxVal - minVal) * 0.5
         if threshold_val < 0: threshold_val = 0
         
-        # 2. Extract a small window around the peak to isolate the star
-        # If we use the whole ROI, noise affects the sigma calculation too much
         h, w = roi_img.shape
         cx, cy = maxLoc
-        win_radius = 15 # 30x30px window around peak
+        win_radius = 15
         
         x1 = max(0, cx - win_radius)
         x2 = min(w, cx + win_radius)
         y1 = max(0, cy - win_radius)
         y2 = min(h, cy + win_radius)
         
-        star_cutout = roi_img[y1:y2, x1:x2]
+        star_cutout = roi_img[y1:y2, x1:x2].astype(float)
+        star_cutout -= np.mean(star_cutout)
+        star_cutout[star_cutout < 0] = 0
         
-        # 3. Calculate Moments to find sigma (width)
-        # Subtract background to reduce noise influence
-        star_float = star_cutout.astype(float)
-        star_float -= np.mean(star_float) # Remove DC offset
-        star_float[star_float < 0] = 0
-        
-        m = cv2.moments(star_float)
+        m = cv2.moments(star_cutout)
         if m['m00'] == 0: return 0.0
         
-        # Centroids
-        ctx = m['m10'] / m['m00']
-        cty = m['m01'] / m['m00']
-        
-        # Central Moments (Variance)
-        mu20 = m['mu20'] / m['m00'] # variance x
-        mu02 = m['mu02'] / m['m00'] # variance y
-        
-        # Sigma = sqrt(variance)
-        sigma_x = math.sqrt(abs(mu20))
-        sigma_y = math.sqrt(abs(mu02))
-        
-        # Average sigma
-        sigma = (sigma_x + sigma_y) / 2.0
-        
-        # FWHM conversion
-        fwhm = 2.355 * sigma
-        return round(fwhm, 2)
-        
-    except Exception as e:
-        # print(e)
+        mu20 = m['mu20'] / m['m00']
+        mu02 = m['mu02'] / m['m00']
+        sigma = (math.sqrt(abs(mu20)) + math.sqrt(abs(mu02))) / 2.0
+        return round(2.355 * sigma, 2)
+    except:
         return 0.0
 
 def generate_frames():
-    # --- Camera Init ---
     lib_path = os.path.abspath(LIB_FILE)
     try:
         asi.init(lib_path)
@@ -486,78 +584,75 @@ def generate_frames():
     applied_exp = -1
 
     while True:
-        # 1. Thread-safe settings read
         with state_lock:
             gain = cam_state['gain']
-            exp_ms = cam_state['exposure_val']
-            roi_def = cam_state['roi_norm'] # Copy ROI definition
+            exp_val = cam_state['exposure_val']
+            exp_mode = cam_state['exposure_mode']
+            font_s = cam_state['font_scale']
+            roi_def = cam_state['roi_norm']
         
-        # 2. Apply Camera Controls
+        # Apply Controls
         try:
             if gain != applied_gain:
                 camera.set_control_value(asi.ASI_GAIN, gain)
                 applied_gain = gain
             
-            exp_us = exp_ms * 1000
-            if exp_us != applied_exp:
-                camera.set_control_value(asi.ASI_EXPOSURE, exp_us)
-                applied_exp = exp_us
+            # Exposure Calc
+            target_us = exp_val * 1000 if exp_mode == 'ms' else exp_val
+            if target_us < 1: target_us = 1 # Hardware safety
+            
+            if target_us != applied_exp:
+                camera.set_control_value(asi.ASI_EXPOSURE, target_us)
+                applied_exp = target_us
         except:
             pass
 
-        # 3. Capture
+        # Capture
         try:
-            frame = camera.capture_video_frame(timeout=exp_ms + 500)
+            # Timeout buffer: convert us to ms, add 500ms safety
+            to_ms = int(target_us / 1000) + 500
+            frame = camera.capture_video_frame(timeout=to_ms)
         except:
             time.sleep(0.01)
             continue
 
-        # 4. Processing
-        # Convert Bayer to Grayscale for FWHM (more accurate intensity)
-        # Convert to RGB for display
-        gray_frame = frame # If Mono
+        # Process
+        gray_frame = frame
         color_frame = frame
-        
         cam_props = camera.get_camera_property()
+        
         if cam_props['IsColorCam']:
             color_frame = cv2.cvtColor(frame, cv2.COLOR_BAYER_RG2RGB)
             gray_frame = cv2.cvtColor(color_frame, cv2.COLOR_RGB2GRAY)
         else:
             color_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-            gray_frame = frame
 
-        # 5. ROI & FWHM Logic
+        # FWHM Overlay
         if roi_def:
             h, w = gray_frame.shape
-            
-            # Convert Normalized (0-1) to Pixels
             rx = int(roi_def['x'] * w)
             ry = int(roi_def['y'] * h)
             rw = int(roi_def['w'] * w)
             rh = int(roi_def['h'] * h)
             
-            # Safety checks
-            if rw > 5 and rh > 5 and rx >= 0 and ry >= 0 and (rx+rw) <= w and (ry+rh) <= h:
-                # Crop for calculation
+            if rw > 5 and rh > 5:
+                # Calc FWHM
                 roi_gray = gray_frame[ry:ry+rh, rx:rx+rw]
-                
-                # Calculate FWHM
                 fwhm_val = calculate_fwhm(roi_gray)
                 
-                # Draw on Output Frame (Green Box)
+                # Draw Box
                 cv2.rectangle(color_frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
                 
-                # Draw Text Background
+                # Draw Text
                 label = f"FWHM: {fwhm_val} px"
-                cv2.rectangle(color_frame, (rx, ry-25), (rx+160, ry), (0, 255, 0), -1)
-                cv2.putText(color_frame, label, (rx+5, ry-7), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-        
-        # 6. Encode
-        # Resize for streaming bandwidth if needed (optional, keeping full res for now)
-        # h, w = color_frame.shape[:2]
-        # if w > 1280:
-        #    color_frame = cv2.resize(color_frame, (1280, 720))
+                
+                # Dynamic Font/Box Sizing
+                thickness = 2
+                (t_w, t_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_s, thickness)
+                
+                cv2.rectangle(color_frame, (rx, ry-t_h-10), (rx+t_w+10, ry), (0, 255, 0), -1)
+                cv2.putText(color_frame, label, (rx+5, ry-5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, font_s, (0, 0, 0), thickness)
 
         ret, buffer = cv2.imencode('.jpg', color_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         frame_bytes = buffer.tobytes()
@@ -581,6 +676,8 @@ def update_settings():
     with state_lock:
         if 'gain' in data: cam_state['gain'] = int(data['gain'])
         if 'exposure_val' in data: cam_state['exposure_val'] = int(data['exposure_val'])
+        if 'exposure_mode' in data: cam_state['exposure_mode'] = str(data['exposure_mode'])
+        if 'font_scale' in data: cam_state['font_scale'] = float(data['font_scale'])
     return jsonify({"status": "ok"})
 
 @app.route('/update_roi', methods=['POST'])
@@ -589,7 +686,6 @@ def update_roi():
     with state_lock:
         if 'clear' in data and data['clear']:
             cam_state['roi_norm'] = None
-            print("ROI Cleared")
         else:
             cam_state['roi_norm'] = {
                 'x': float(data['x']),
@@ -597,7 +693,6 @@ def update_roi():
                 'w': float(data['w']),
                 'h': float(data['h'])
             }
-            print(f"ROI Updated: {cam_state['roi_norm']}")
     return jsonify({"status": "ok"})
 
 if __name__ == '__main__':
