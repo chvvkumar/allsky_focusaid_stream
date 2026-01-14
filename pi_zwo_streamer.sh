@@ -211,27 +211,6 @@ HTML_TEMPLATE = """
         input[type=range] { width: 100%; height: 6px; background: #444; border-radius: 3px; -webkit-appearance: none; }
         input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; background: #d32f2f; border-radius: 50%; }
 
-        .btn-action {
-            width: 100%; padding: 8px; background: #444; color: white; border: none; border-radius: 4px; margin-top: 5px; cursor: pointer;
-        }
-        .btn-action:hover { background: #555; }
-        
-        /* Floating Toolbar for Pan/Select */
-        #toolbar {
-            position: fixed;
-            bottom: 20px; right: 20px;
-            z-index: 101;
-            display: flex;
-            gap: 10px;
-        }
-        .tool-btn {
-            width: 50px; height: 50px; border-radius: 25px; border: none;
-            background: #333; color: #fff; font-size: 20px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-            cursor: pointer;
-        }
-        .tool-btn.active { background: #d32f2f; }
-
     </style>
 </head>
 <body>
@@ -243,11 +222,6 @@ HTML_TEMPLATE = """
                 <div id="selection-box"></div>
             </div>
         </div>
-    </div>
-    
-    <div id="toolbar">
-        <button class="tool-btn active" id="btn-select" onclick="setTool('select')" title="Select Star">⛝</button>
-        <button class="tool-btn" id="btn-pan" onclick="setTool('pan')" title="Pan Image">✋</button>
     </div>
 
     <div id="ui-layer">
@@ -281,9 +255,19 @@ HTML_TEMPLATE = """
                 <input type="range" id="rng-exp" min="1" max="5000" value="100" 
                        oninput="updateVal('exp', this.value)" onchange="sendSettings()">
             </div>
-
+            
+            <hr style="border-color: #333; margin: 15px 0;">
+            
             <div class="control-group">
-                <button class="btn-action" onclick="setDaylight()">☀ Daylight Preset (Fast)</button>
+                <label style="margin-bottom: 8px;">Interaction Mode</label>
+                <div style="display: flex; gap: 10px;">
+                    <button class="tool-btn-inline active" id="btn-select" onclick="setTool('select')" style="flex: 1; padding: 10px; background: #d32f2f; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold;">
+                        ◻ Select Star
+                    </button>
+                    <button class="tool-btn-inline" id="btn-pan" onclick="setTool('pan')" style="flex: 1; padding: 10px; background: #444; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold;">
+                        ✋ Pan Image
+                    </button>
+                </div>
             </div>
             
             <hr style="border-color: #333; margin: 15px 0;">
@@ -328,9 +312,18 @@ HTML_TEMPLATE = """
         // --- Interaction Logic ---
         function setTool(t) {
             currentTool = t;
-            document.getElementById('btn-select').classList.toggle('active', t==='select');
-            document.getElementById('btn-pan').classList.toggle('active', t==='pan');
-            layer.style.cursor = t==='pan' ? 'grab' : 'crosshair';
+            const selectBtn = document.getElementById('btn-select');
+            const panBtn = document.getElementById('btn-pan');
+            
+            if(t === 'select') {
+                selectBtn.style.background = '#d32f2f';
+                panBtn.style.background = '#444';
+                layer.style.cursor = 'crosshair';
+            } else {
+                selectBtn.style.background = '#444';
+                panBtn.style.background = '#d32f2f';
+                layer.style.cursor = 'grab';
+            }
         }
 
         function updateZoom(val) {
@@ -484,15 +477,6 @@ HTML_TEMPLATE = """
                 rng.value = 100; // Reset to safe us value
                 document.getElementById('val-exp').innerText = rng.value + ' µs';
             }
-            sendSettings();
-        }
-
-        function setDaylight() {
-            setExpMode('us');
-            document.getElementById('rng-exp').value = 100;
-            document.getElementById('rng-gain').value = 0;
-            updateVal('exp', 100);
-            updateVal('gain', 0);
             sendSettings();
         }
 
