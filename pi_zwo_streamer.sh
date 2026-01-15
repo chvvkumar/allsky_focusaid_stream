@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer v6 (Zoom, Daylight Mode, Configurable Text)
+# ZWO ASI Camera Streamer v6.1 (Zoom, Daylight Mode, Configurable Text)
+# Fixed FWHM Logic: Improved background subtraction and hot pixel rejection.
 # ==============================================================================
 
 GREEN='\033[0;32m'
@@ -525,31 +526,52 @@ HTML_TEMPLATE = """
 
 def calculate_fwhm(roi_img):
     try:
-        minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(roi_img)
-        threshold_val = maxVal - (maxVal - minVal) * 0.5
-        if threshold_val < 0: threshold_val = 0
+        # 1. Hot Pixel Protection: Blur slightly just to find the star location
+        # This prevents locking onto a single bright pixel
+        blurred_for_search = cv2.GaussianBlur(roi_img, (5, 5), 0)
+        minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(blurred_for_search)
         
+        # If signal is too low, abort
+        if maxVal < 10: return 0.0
+
         h, w = roi_img.shape
         cx, cy = maxLoc
-        win_radius = 15
+        win_radius = 20 # Increased window slightly to capture wings
         
         x1 = max(0, cx - win_radius)
         x2 = min(w, cx + win_radius)
         y1 = max(0, cy - win_radius)
         y2 = min(h, cy + win_radius)
         
+        # 2. Extract Data (Use RAW data for moments, not blurred)
         star_cutout = roi_img[y1:y2, x1:x2].astype(float)
-        star_cutout -= np.mean(star_cutout)
+        
+        # 3. Background Subtraction
+        # PREVIOUS BUG: Using np.mean included the star light, clipping wings.
+        # FIX: Use np.median to estimate background level more accurately.
+        bg_level = np.median(star_cutout)
+        star_cutout -= bg_level
         star_cutout[star_cutout < 0] = 0
         
         m = cv2.moments(star_cutout)
         if m['m00'] == 0: return 0.0
         
+        # 4. Calculate Sigma
+        # mu20/m00 is variance (sigma^2)
         mu20 = m['mu20'] / m['m00']
         mu02 = m['mu02'] / m['m00']
-        sigma = (math.sqrt(abs(mu20)) + math.sqrt(abs(mu02))) / 2.0
+        
+        sigma_x = math.sqrt(abs(mu20))
+        sigma_y = math.sqrt(abs(mu02))
+        
+        # Average sigma assuming roughly circular star
+        sigma = (sigma_x + sigma_y) / 2.0
+        
+        # 5. Convert to FWHM (Full Width at Half Maximum)
+        # FWHM = 2.355 * sigma
         return round(2.355 * sigma, 2)
-    except:
+    except Exception as e:
+        # print(f"FWHM Error: {e}") 
         return 0.0
 
 def init_camera():
