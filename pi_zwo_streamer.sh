@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer v8 
+# ZWO ASI Camera Streamer v9 (UI Graph, Text Size, Graph Height)
 # ==============================================================================
 
 GREEN='\033[0;32m'
@@ -9,7 +9,7 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (Ultimate Edition)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v9)...${NC}"
 
 # --- 1. System Dependencies Check ---
 if ! dpkg -s libopencv-dev >/dev/null 2>&1; then
@@ -57,8 +57,9 @@ cam_state = {
     'gain': 300,
     'exposure_val': 100,
     'exposure_mode': 'ms',
-    'scale_percent': 50,
-    'roi_norm': None
+    'roi_norm': None,
+    'font_scale': 1.0,      # Text Size
+    'graph_height': 60      # Profile Graph Height (px)
 }
 state_lock = threading.Lock()
 
@@ -69,7 +70,7 @@ camera = None
 camera_lock = threading.Lock()
 app = Flask(__name__)
 
-# ================= HTML TEMPLATE (RESTORED ORIGINAL UI) =================
+# ================= HTML TEMPLATE =================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -86,12 +87,12 @@ HTML_TEMPLATE = """
         #interaction-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 10; }
         #selection-box { position: absolute; border: 2px dashed rgba(0, 255, 0, 0.9); background: rgba(0, 255, 0, 0.1); display: none; z-index: 20; pointer-events: none; }
 
-        #ui-layer { position: fixed; top: 10px; left: 10px; z-index: 100; width: 320px; max-width: 95vw; pointer-events: none; }
+        #ui-layer { position: fixed; top: 10px; left: 10px; z-index: 100; width: 340px; max-width: 95vw; pointer-events: none; }
         
         .controls { 
-            pointer-events: auto; background: rgba(20, 20, 20, 0.85); backdrop-filter: blur(8px);
+            pointer-events: auto; background: rgba(20, 20, 20, 0.9); backdrop-filter: blur(8px);
             padding: 15px; border-radius: 12px; color: #eee; border: 1px solid rgba(255,255,255,0.1);
-            display: none; max-height: 80vh; overflow-y: auto;
+            display: none; max-height: 85vh; overflow-y: auto;
         }
 
         #toggle-btn { 
@@ -110,6 +111,11 @@ HTML_TEMPLATE = """
         input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; background: #d32f2f; border-radius: 50%; }
         
         .tool-btn { flex: 1; padding: 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; color: white; }
+
+        /* History Graph Canvas */
+        #graph-container { background: #111; border: 1px solid #444; border-radius: 4px; margin-bottom: 15px; padding: 5px; }
+        canvas { width: 100%; height: 100px; display: block; }
+
     </style>
 </head>
 <body>
@@ -131,6 +137,11 @@ HTML_TEMPLATE = """
                 <strong>CAMERA CONTROLS</strong>
                 <button onclick="toggleUI()" style="background:none; border:none; color:#fff; font-size:18px;">&times;</button>
             </div>
+            
+            <div id="graph-container">
+                <div style="font-size:10px; color:#888; margin-bottom:2px;">Focus History (Lower is Better)</div>
+                <canvas id="historyGraph"></canvas>
+            </div>
 
             <div class="control-group">
                 <label>Digital Zoom <span id="val-zoom" class="val-display">1.0x</span></label>
@@ -150,6 +161,18 @@ HTML_TEMPLATE = """
             <div class="control-group">
                 <label>Exposure Time <span id="val-exp" class="val-display">100</span></label>
                 <input type="range" id="rng-exp" min="1" max="5000" value="100" oninput="updateVal('exp', this.value)" onchange="sendSettings()">
+            </div>
+            
+            <hr style="border-color: #333; margin: 15px 0;">
+
+            <div class="control-group">
+                <label>Overlay Text Size <span id="val-font" class="val-display">1.0</span></label>
+                <input type="range" id="rng-font" min="5" max="30" value="10" oninput="updateVal('font', this.value)" onchange="sendSettings()">
+            </div>
+
+            <div class="control-group">
+                <label>Profile Graph Height <span id="val-gheight" class="val-display">60px</span></label>
+                <input type="range" id="rng-gheight" min="20" max="200" value="60" oninput="updateVal('gheight', this.value)" onchange="sendSettings()">
             </div>
             
             <hr style="border-color: #333; margin: 15px 0;">
@@ -179,7 +202,55 @@ HTML_TEMPLATE = """
         let startX, startY;
         let isDragging = false;
         
-        // Event Listeners
+        // --- Graphing Logic ---
+        const canvas = document.getElementById('historyGraph');
+        const ctx = canvas.getContext('2d');
+        
+        function drawGraph(data) {
+            // Resize canvas internal buffer to match display
+            canvas.width = canvas.offsetWidth;
+            canvas.height = canvas.offsetHeight;
+            const w = canvas.width;
+            const h = canvas.height;
+            
+            ctx.clearRect(0, 0, w, h);
+            
+            if(data.length < 2) return;
+            
+            const maxVal = Math.max(...data, 10);
+            const minVal = Math.min(...data); // Optional: scale from 0 or min? using 0 for HFD is safer
+            
+            ctx.beginPath();
+            ctx.strokeStyle = '#00e5ff';
+            ctx.lineWidth = 2;
+            
+            data.forEach((val, i) => {
+                const x = (i / (data.length - 1)) * w;
+                // Invert Y so 0 is at bottom
+                const y = h - ((val / (maxVal * 1.1)) * h); 
+                if (i===0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+            
+            // Draw current value text
+            ctx.fillStyle = '#fff';
+            ctx.font = '12px sans-serif';
+            ctx.fillText(data[data.length-1].toFixed(2), w - 40, 15);
+        }
+        
+        function fetchStatus() {
+            if(document.getElementById('control-panel').style.display === 'none') return;
+            
+            fetch('/get_status')
+                .then(r => r.json())
+                .then(d => {
+                    if(d.history) drawGraph(d.history);
+                });
+        }
+        setInterval(fetchStatus, 1000);
+
+        // --- Interaction Logic ---
         layer.addEventListener('touchstart', handleStart, {passive: false});
         layer.addEventListener('mousedown', handleStart);
         layer.addEventListener('touchmove', handleMove, {passive: false});
@@ -273,7 +344,7 @@ HTML_TEMPLATE = """
         }
         
         // Settings Logic
-        let settings = {gain: 300, exp: 100};
+        let settings = {gain: 300, exp: 100, font: 10, gheight: 60};
         let expMode = 'ms';
 
         function toggleUI() {
@@ -282,6 +353,9 @@ HTML_TEMPLATE = """
             const show = p.style.display === 'none';
             p.style.display = show ? 'block' : 'none';
             b.style.display = show ? 'none' : 'block';
+            
+            // Trigger graph fetch immediately on open
+            if(show) fetchStatus();
         }
 
         function setExpMode(m) {
@@ -295,9 +369,14 @@ HTML_TEMPLATE = """
         }
 
         function updateVal(k, v) {
-            document.getElementById('val-'+k).innerText = v + (k==='exp' ? (expMode==='ms'?' ms':' µs') : '');
+            if(k === 'font') document.getElementById('val-'+k).innerText = (v/10.0).toFixed(1);
+            else if(k === 'gheight') document.getElementById('val-'+k).innerText = v + 'px';
+            else document.getElementById('val-'+k).innerText = v + (k==='exp' ? (expMode==='ms'?' ms':' µs') : '');
+            
             if(k === 'gain') settings.gain = parseInt(v);
             if(k === 'exp') settings.exp = parseInt(v);
+            if(k === 'font') settings.font = parseInt(v);
+            if(k === 'gheight') settings.gheight = parseInt(v);
         }
 
         function sendSettings() {
@@ -307,7 +386,9 @@ HTML_TEMPLATE = """
                 body: JSON.stringify({
                     gain: settings.gain, 
                     exposure_val: settings.exp,
-                    exposure_mode: expMode
+                    exposure_mode: expMode,
+                    font_scale: settings.font / 10.0,
+                    graph_height: settings.gheight
                 })
             });
         }
@@ -357,56 +438,46 @@ def calculate_hfd(roi_img):
     except:
         return 0.0, (0,0)
 
-def draw_overlays(frame, roi_img, hfd_val, centroid, rect_offset):
+def draw_overlays(frame, roi_img, hfd_val, centroid, rect_offset, state):
     rx, ry, rw, rh = rect_offset
     cx_local, cy_local = centroid
+    font_s = state.get('font_scale', 1.0)
+    g_h = state.get('graph_height', 60)
     
     # 1. HFD Box & Label
     cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 1)
     label = f"HFD: {hfd_val:.2f}"
-    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    
+    thickness = 2
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_s, thickness)
+    
     cv2.rectangle(frame, (rx, ry-th-6), (rx+tw+6, ry), (0, 0, 0), -1)
-    cv2.putText(frame, label, (rx+3, ry-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(frame, label, (rx+3, ry-5), cv2.FONT_HERSHEY_SIMPLEX, font_s, (0, 255, 0), thickness)
 
     # 2. Star Profile Graph (Bottom Left of ROI)
     iy = int(cy_local)
     if iy >= 0 and iy < roi_img.shape[0]:
         row_data = roi_img[iy, :]
-        g_h, g_w = 50, rw
+        g_w = rw
         g_x, g_y = rx, ry + rh + 5
         
         cv2.rectangle(frame, (g_x, g_y), (g_x+g_w, g_y+g_h), (0,0,0), -1)
         
         # Plot
         pts = []
-        mx = np.max(row_data) if np.max(row_data) > 0 else 255
+        # Normalizing to max value in the row to fill the graph height
+        row_max = np.max(row_data)
+        scale_max = row_max if row_max > 0 else 255
+        
         for x, val in enumerate(row_data):
             px = int(g_x + (x/len(row_data))*g_w)
-            py = int((g_y + g_h) - (val/255.0)*g_h)
+            py = int((g_y + g_h) - (val/scale_max)*g_h)
             pts.append((px, py))
+            
         if len(pts) > 1:
             cv2.polylines(frame, [np.array(pts)], False, (0, 255, 255), 1)
+        
         cv2.putText(frame, "Profile", (g_x+2, g_y+10), cv2.FONT_HERSHEY_PLAIN, 0.8, (150,150,150), 1)
-
-    # 3. History Graph (Bottom Right Screen)
-    h, w, _ = frame.shape
-    hist_w, hist_h = 200, 100
-    hx, hy = w - hist_w - 20, h - hist_h - 20
-    
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (hx, hy), (hx+hist_w, hy+hist_h), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-    
-    if len(hfd_history) > 1:
-        max_h = max(max(hfd_history), 5)
-        pts = []
-        for i, val in enumerate(hfd_history):
-            px = int(hx + (i/50)*hist_w)
-            py = int((hy + hist_h) - (val/max_h)*(hist_h-10))
-            pts.append((px, py))
-        cv2.polylines(frame, [np.array(pts)], False, (0, 200, 255), 2)
-    
-    cv2.putText(frame, "Focus History", (hx+5, hy+15), cv2.FONT_HERSHEY_PLAIN, 1.0, (200,200,200), 1)
 
 # ================= VIDEO LOOP =================
 
@@ -432,10 +503,13 @@ def generate_frames():
 
     while True:
         with state_lock:
-            gain = cam_state['gain']
-            exp_val = cam_state['exposure_val']
-            exp_mode = cam_state['exposure_mode']
-            roi_def = cam_state['roi_norm']
+            # Create a local copy of state to avoid locking during processing
+            current_state = cam_state.copy()
+            
+        gain = current_state['gain']
+        exp_val = current_state['exposure_val']
+        exp_mode = current_state['exposure_mode']
+        roi_def = current_state['roi_norm']
         
         # Apply Controls
         try:
@@ -476,7 +550,9 @@ def generate_frames():
                 
                 hfd, cent = calculate_hfd(roi_gray)
                 hfd_history.append(hfd)
-                draw_overlays(color_frame, roi_gray, hfd, cent, (rx, ry, rw, rh))
+                
+                # Pass full state (containing font_scale and graph_height)
+                draw_overlays(color_frame, roi_gray, hfd, cent, (rx, ry, rw, rh), current_state)
 
         ret, buffer = cv2.imencode('.jpg', color_frame)
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
@@ -488,6 +564,13 @@ def index(): return render_template_string(HTML_TEMPLATE)
 @app.route('/video_feed')
 def video_feed(): return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+@app.route('/get_status')
+def get_status():
+    # Return graph data for the UI
+    return jsonify({
+        'history': list(hfd_history)
+    })
+
 @app.route('/update_settings', methods=['POST'])
 def update_settings():
     d = request.json
@@ -495,6 +578,8 @@ def update_settings():
         if 'gain' in d: cam_state['gain'] = int(d['gain'])
         if 'exposure_val' in d: cam_state['exposure_val'] = int(d['exposure_val'])
         if 'exposure_mode' in d: cam_state['exposure_mode'] = str(d['exposure_mode'])
+        if 'font_scale' in d: cam_state['font_scale'] = float(d['font_scale'])
+        if 'graph_height' in d: cam_state['graph_height'] = int(d['graph_height'])
     return jsonify({"status":"ok"})
 
 @app.route('/update_roi', methods=['POST'])
