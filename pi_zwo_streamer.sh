@@ -57,6 +57,7 @@ cam_state = {
     'exposure_val': 100,
     'exposure_mode': 'ms',
     'roi_norm': None,
+    'roi_selection_area': None,  # User-defined area for star selection
     'font_scale': 1.0,      
     'graph_height': 100,
     'auto_select_pending': False     
@@ -113,6 +114,39 @@ HTML_TEMPLATE = """
         /* History Graph Canvas */
         #graph-container { background: #111; border: 1px solid #444; border-radius: 4px; margin-bottom: 15px; padding: 5px; }
         canvas { width: 100%; height: 100px; display: block; }
+        
+        /* ROI Selection Overlay */
+        #roi-selection-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 200;
+            display: none;
+            cursor: crosshair;
+        }
+        
+        #roi-rect {
+            position: absolute;
+            border: 2px dashed #ffeb3b;
+            background: rgba(255, 235, 59, 0.1);
+            pointer-events: none;
+        }
+        
+        #roi-hint {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.8);
+            color: #ffeb3b;
+            padding: 20px;
+            border-radius: 8px;
+            font-size: 16px;
+            pointer-events: none;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -172,9 +206,17 @@ HTML_TEMPLATE = """
             <hr style="border-color: #333; margin: 15px 0;">
             
             <div class="control-group">
+                <button class="tool-btn" onclick="startROISelection()">📐 Select ROI Area</button>
                 <button class="tool-btn" onclick="triggerAutoSelect()">🎯 Auto-Select Star</button>
+                <button class="tool-btn" style="background: #666;" onclick="clearROI()">❌ Clear ROI & Selection</button>
             </div>
         </div>
+    </div>
+    
+    <!-- ROI Selection Overlay -->
+    <div id="roi-selection-overlay">
+        <div id="roi-hint">Click and drag to select ROI area<br><small>Press ESC to cancel</small></div>
+        <div id="roi-rect"></div>
     </div>
 
     <script>
@@ -287,6 +329,178 @@ HTML_TEMPLATE = """
             fetch('/trigger_auto_select', {method:'POST'});
         }
         
+        function clearROI() {
+            fetch('/clear_roi_area', {method:'POST'});
+            fetch('/update_roi', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({clear:true})});
+        }
+        
+        // ROI Selection Logic
+        let roiSelectionActive = false;
+        let roiStartX, roiStartY;
+        
+        function startROISelection() {
+            roiSelectionActive = true;
+            document.getElementById('roi-selection-overlay').style.display = 'block';
+            document.getElementById('control-panel').style.display = 'none';
+            document.getElementById('toggle-btn').style.display = 'block';
+        }
+        
+        function cancelROISelection() {
+            roiSelectionActive = false;
+            document.getElementById('roi-selection-overlay').style.display = 'none';
+            document.getElementById('roi-rect').style.display = 'none';
+        }
+        
+        const overlay = document.getElementById('roi-selection-overlay');
+        const roiRect = document.getElementById('roi-rect');
+        
+        overlay.addEventListener('mousedown', (e) => {
+            if (!roiSelectionActive) return;
+            document.getElementById('roi-hint').style.display = 'none';
+            roiStartX = e.clientX;
+            roiStartY = e.clientY;
+            roiRect.style.left = roiStartX + 'px';
+            roiRect.style.top = roiStartY + 'px';
+            roiRect.style.width = '0px';
+            roiRect.style.height = '0px';
+            roiRect.style.display = 'block';
+        });
+        
+        overlay.addEventListener('mousemove', (e) => {
+            if (!roiSelectionActive || !roiRect.style.display || roiRect.style.display === 'none') return;
+            const w = e.clientX - roiStartX;
+            const h = e.clientY - roiStartY;
+            if (w < 0) {
+                roiRect.style.left = e.clientX + 'px';
+                roiRect.style.width = (-w) + 'px';
+            } else {
+                roiRect.style.width = w + 'px';
+            }
+            if (h < 0) {
+                roiRect.style.top = e.clientY + 'px';
+                roiRect.style.height = (-h) + 'px';
+            } else {
+                roiRect.style.height = h + 'px';
+            }
+        });
+        
+        overlay.addEventListener('mouseup', (e) => {
+            if (!roiSelectionActive) return;
+            const endX = e.clientX;
+            const endY = e.clientY;
+            
+            // Get image dimensions
+            const img = document.getElementById('video-feed');
+            const imgRect = img.getBoundingClientRect();
+            
+            // Calculate normalized coordinates relative to image
+            const x1 = Math.min(roiStartX, endX) - imgRect.left;
+            const y1 = Math.min(roiStartY, endY) - imgRect.top;
+            const x2 = Math.max(roiStartX, endX) - imgRect.left;
+            const y2 = Math.max(roiStartY, endY) - imgRect.top;
+            
+            // Clamp to image bounds
+            const nx1 = Math.max(0, Math.min(x1, imgRect.width));
+            const ny1 = Math.max(0, Math.min(y1, imgRect.height));
+            const nx2 = Math.max(0, Math.min(x2, imgRect.width));
+            const ny2 = Math.max(0, Math.min(y2, imgRect.height));
+            
+            // Normalize to 0-1 range
+            const normX = nx1 / imgRect.width;
+            const normY = ny1 / imgRect.height;
+            const normW = (nx2 - nx1) / imgRect.width;
+            const normH = (ny2 - ny1) / imgRect.height;
+            
+            // Send to server if area is reasonable (at least 20x20 pixels)
+            if ((nx2 - nx1) > 20 && (ny2 - ny1) > 20) {
+                fetch('/set_roi_area', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({x: normX, y: normY, w: normW, h: normH})
+                });
+            }
+            
+            cancelROISelection();
+        });
+        
+        // Touch support for mobile
+        overlay.addEventListener('touchstart', (e) => {
+            if (!roiSelectionActive) return;
+            e.preventDefault();
+            const touch = e.touches[0];
+            document.getElementById('roi-hint').style.display = 'none';
+            roiStartX = touch.clientX;
+            roiStartY = touch.clientY;
+            roiRect.style.left = roiStartX + 'px';
+            roiRect.style.top = roiStartY + 'px';
+            roiRect.style.width = '0px';
+            roiRect.style.height = '0px';
+            roiRect.style.display = 'block';
+        });
+        
+        overlay.addEventListener('touchmove', (e) => {
+            if (!roiSelectionActive || !roiRect.style.display || roiRect.style.display === 'none') return;
+            e.preventDefault();
+            const touch = e.touches[0];
+            const w = touch.clientX - roiStartX;
+            const h = touch.clientY - roiStartY;
+            if (w < 0) {
+                roiRect.style.left = touch.clientX + 'px';
+                roiRect.style.width = (-w) + 'px';
+            } else {
+                roiRect.style.width = w + 'px';
+            }
+            if (h < 0) {
+                roiRect.style.top = touch.clientY + 'px';
+                roiRect.style.height = (-h) + 'px';
+            } else {
+                roiRect.style.height = h + 'px';
+            }
+        });
+        
+        overlay.addEventListener('touchend', (e) => {
+            if (!roiSelectionActive) return;
+            e.preventDefault();
+            const touch = e.changedTouches[0];
+            const endX = touch.clientX;
+            const endY = touch.clientY;
+            
+            const img = document.getElementById('video-feed');
+            const imgRect = img.getBoundingClientRect();
+            
+            const x1 = Math.min(roiStartX, endX) - imgRect.left;
+            const y1 = Math.min(roiStartY, endY) - imgRect.top;
+            const x2 = Math.max(roiStartX, endX) - imgRect.left;
+            const y2 = Math.max(roiStartY, endY) - imgRect.top;
+            
+            const nx1 = Math.max(0, Math.min(x1, imgRect.width));
+            const ny1 = Math.max(0, Math.min(y1, imgRect.height));
+            const nx2 = Math.max(0, Math.min(x2, imgRect.width));
+            const ny2 = Math.max(0, Math.min(y2, imgRect.height));
+            
+            const normX = nx1 / imgRect.width;
+            const normY = ny1 / imgRect.height;
+            const normW = (nx2 - nx1) / imgRect.width;
+            const normH = (ny2 - ny1) / imgRect.height;
+            
+            if ((nx2 - nx1) > 20 && (ny2 - ny1) > 20) {
+                fetch('/set_roi_area', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({x: normX, y: normY, w: normW, h: normH})
+                });
+            }
+            
+            cancelROISelection();
+        });
+        
+        // ESC key to cancel
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && roiSelectionActive) {
+                cancelROISelection();
+            }
+        });
+        
         document.getElementById('control-panel').style.display = 'none';
     </script>
 </body>
@@ -389,16 +603,34 @@ def draw_overlays(frame, roi_img, hfd_val, centroid, peak_coords, rect_offset, s
         lbl = "Profile" if r_range > NOISE_THRESHOLD else "Noise"
         cv2.putText(frame, lbl, (g_x+2, g_y+12), cv2.FONT_HERSHEY_PLAIN, 0.8, (150,150,150), 1)
 
-def auto_select_star(frame, target_us):
+def auto_select_star(frame, target_us, roi_area=None):
     """Perform star auto-selection with enhanced validation to ensure actual stars are selected"""
-    # Detect star on full frame
+    # Detect star on full frame or within specified ROI area
     if len(frame.shape)==3: gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     else: gray = frame
     
     h, w = gray.shape
     
+    # If ROI area is specified, limit search to that area
+    search_gray = gray
+    offset_x, offset_y = 0, 0
+    
+    if roi_area:
+        rx = int(roi_area['x'] * w)
+        ry = int(roi_area['y'] * h)
+        rw = int(roi_area['w'] * w)
+        rh = int(roi_area['h'] * h)
+        
+        # Validate ROI bounds
+        if rw > 10 and rh > 10 and rx >= 0 and ry >= 0 and rx + rw <= w and ry + rh <= h:
+            search_gray = gray[ry:ry+rh, rx:rx+rw]
+            offset_x, offset_y = rx, ry
+            h, w = search_gray.shape
+        else:
+            roi_area = None  # Invalid ROI, search full frame
+    
     # 1. Blur to suppress hot pixels (High frequency noise)
-    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+    blurred = cv2.GaussianBlur(search_gray, (9, 9), 2)
     
     # 2. IMPROVED Dynamic Thresholding
     mean_val, std_val = cv2.meanStdDev(blurred)
@@ -449,7 +681,7 @@ def auto_select_star(frame, target_us):
         
         if test_size < 8: continue
         
-        test_roi = gray[ty:ty+test_size, tx:tx+test_size]
+        test_roi = search_gray[ty:ty+test_size, tx:tx+test_size]
         
         # STAR VALIDATION - Check for proper PSF characteristics
         # A real star should have:
@@ -509,7 +741,9 @@ def auto_select_star(frame, target_us):
     best_star = None
     if candidates:
         candidates.sort(key=lambda x: x['score'], reverse=True)
-        best_star = candidates[0]['pos']
+        # Adjust coordinates back to full frame if using ROI area
+        cx, cy = candidates[0]['pos']
+        best_star = (cx + offset_x, cy + offset_y)
     
     # 5. VALIDATED Fallback - only if we find something star-like
     if best_star is None:
@@ -524,7 +758,7 @@ def auto_select_star(frame, target_us):
         ty = min(ty, h - test_size)
         
         if tx >= 0 and ty >= 0:
-            test_roi = gray[ty:ty+test_size, tx:tx+test_size]
+            test_roi = search_gray[ty:ty+test_size, tx:tx+test_size]
             roi_mean = np.mean(test_roi)
             
             # Only use if it's:
@@ -535,23 +769,30 @@ def auto_select_star(frame, target_us):
             dynamic_range = maxVal - roi_mean
             
             if brightness_ratio > 1.5 and maxVal < 250 and dynamic_range > 20:
-                best_star = maxLoc
+                # Adjust for ROI offset
+                best_star = (maxLoc[0] + offset_x, maxLoc[1] + offset_y)
     
     # 6. Apply ROI if star found
     if best_star:
         cx, cy = best_star
         roi_size = 128  # Fixed ROI size
         
+        # Get original frame dimensions
+        if len(frame.shape) == 3:
+            orig_h, orig_w, _ = frame.shape
+        else:
+            orig_h, orig_w = frame.shape
+        
         nx = int(cx - roi_size // 2)
         ny = int(cy - roi_size // 2)
         
-        # Clamp to bounds
-        nx = max(0, min(nx, w - roi_size))
-        ny = max(0, min(ny, h - roi_size))
+        # Clamp to bounds of original frame
+        nx = max(0, min(nx, orig_w - roi_size))
+        ny = max(0, min(ny, orig_h - roi_size))
         
         return {
-            'x': nx/w, 'y': ny/h, 
-            'w': roi_size/w, 'h': roi_size/h
+            'x': nx/orig_w, 'y': ny/orig_h, 
+            'w': roi_size/orig_w, 'h': roi_size/orig_h
         }
     
     return None
@@ -616,12 +857,26 @@ def generate_frames():
         # --- AUTO STAR SELECTION ---
         # Only perform auto-selection after camera has stabilized (wait 3 frames)
         if auto_select and frames_since_exp_change >= 3:
-            result = auto_select_star(frame, target_us)
+            roi_selection_area = current_state.get('roi_selection_area')
+            result = auto_select_star(frame, target_us, roi_selection_area)
             with state_lock:
                 cam_state['roi_norm'] = result
                 cam_state['auto_select_pending'] = False
             roi_def = result
 
+        # --- DRAW ROI SELECTION AREA ---
+        roi_selection_area = current_state.get('roi_selection_area')
+        if roi_selection_area:
+            h, w, _ = color_frame.shape
+            sx = int(roi_selection_area['x'] * w)
+            sy = int(roi_selection_area['y'] * h)
+            sw = int(roi_selection_area['w'] * w)
+            sh = int(roi_selection_area['h'] * h)
+            # Draw yellow dashed rectangle for selection area
+            cv2.rectangle(color_frame, (sx, sy), (sx+sw, sy+sh), (0, 255, 255), 2)
+            cv2.putText(color_frame, "Selection Area", (sx+3, sy+15), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        
         # --- ROI PROCESSING ---
         if roi_def:
             h, w, _ = color_frame.shape
@@ -678,6 +933,22 @@ def update_roi():
             'x': float(d['x']), 'y': float(d['y']),
             'w': float(d['w']), 'h': float(d['h'])
         }
+    return jsonify({"status":"ok"})
+
+@app.route('/set_roi_area', methods=['POST'])
+def set_roi_area():
+    d = request.json
+    with state_lock:
+        cam_state['roi_selection_area'] = {
+            'x': float(d['x']), 'y': float(d['y']),
+            'w': float(d['w']), 'h': float(d['h'])
+        }
+    return jsonify({"status":"ok"})
+
+@app.route('/clear_roi_area', methods=['POST'])
+def clear_roi_area():
+    with state_lock:
+        cam_state['roi_selection_area'] = None
     return jsonify({"status":"ok"})
 
 if __name__ == '__main__':
