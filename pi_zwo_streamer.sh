@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer (v12.1 - Scalable Graph)
+# ZWO ASI Camera Streamer (v12.2 - Peak Graph Fix)
 # ==============================================================================
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v12.1)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v12.2)...${NC}"
 
 # --- 1. System Dependencies ---
 if ! dpkg -s libopencv-dev >/dev/null 2>&1; then
@@ -58,7 +58,7 @@ cam_state = {
     'exposure_mode': 'ms',
     'roi_norm': None,
     'font_scale': 1.0,      
-    'graph_height': 100     # Controls size (height, with locked aspect ratio)
+    'graph_height': 100     
 }
 state_lock = threading.Lock()
 
@@ -403,14 +403,19 @@ def calculate_hfd(roi_img):
         blurred = cv2.GaussianBlur(roi_img, (3, 3), 0)
         minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(blurred)
         
-        if maxVal < 5: return 0.0, maxLoc
+        # Returns peak_coords as the 3rd argument
+        if maxVal < 5: return 0.0, maxLoc, maxLoc
 
         bg = np.median(roi_img)
         star_data = roi_img.astype(float) - bg
-        star_data[star_data < 0] = 0
+        
+        # NOISE GATE: Ignore pixels dimmer than 20% of the peak range
+        # This prevents background noise from destroying HFD calc
+        threshold = (maxVal - bg) * 0.2
+        star_data[star_data < threshold] = 0
         
         m = cv2.moments(star_data)
-        if m['m00'] == 0: return 0.0, maxLoc
+        if m['m00'] == 0: return 0.0, maxLoc, maxLoc
         cx = m['m10'] / m['m00']
         cy = m['m01'] / m['m00']
         
@@ -421,84 +426,63 @@ def calculate_hfd(roi_img):
         total_flux = np.sum(star_data)
         weighted_flux = np.sum(star_data * distances)
         
-        if total_flux == 0: return 0.0, (cx, cy)
-        return round((weighted_flux / total_flux) * 2.0, 2), (cx, cy)
+        if total_flux == 0: return 0.0, (cx, cy), maxLoc
+        return round((weighted_flux / total_flux) * 2.0, 2), (cx, cy), maxLoc
     except:
-        return 0.0, (0,0)
+        return 0.0, (0,0), (0,0)
 
-def draw_overlays(frame, roi_img, hfd_val, centroid, rect_offset, state):
+def draw_overlays(frame, roi_img, hfd_val, centroid, peak_coords, rect_offset, state):
     rx, ry, rw, rh = rect_offset
-    cx_local, cy_local = centroid
-    font_s = state.get('font_scale', 1.0)
-    
-    # 1. Box Scaling (New: Maintains Aspect Ratio)
+    # Graph Scaling
     g_h = state.get('graph_height', 100)
-    # Scale width with height (Aspect Ratio ~1.5)
     g_w = int(g_h * 1.5)
     
-    # 2. Collision Detection (Flip Logic & Centering)
+    # Box Collision & Centering
     img_h, img_w, _ = frame.shape
-    
-    # Horizontal: Center graph relative to ROI, then clamp to screen
     g_x = rx + (rw // 2) - (g_w // 2)
     g_x = max(0, min(g_x, img_w - g_w))
-    
-    # Vertical: Default Below
     g_y = ry + rh + 5
-    
-    # If it falls off bottom, put it ABOVE ROI
     if g_y + g_h > img_h:
         g_y = ry - 5 - g_h
-        # If that also falls off top (rare), clamp to 0
         if g_y < 0: g_y = 0
 
-    # 3. Draw HFD Text (Anchor to ROI box, not graph)
+    # Draw ROI Box & HFD
+    font_s = state.get('font_scale', 1.0)
     cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 1)
     label = f"HFD: {hfd_val:.2f}"
     thickness = 2
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_s, thickness)
-    
-    # Text background box
     cv2.rectangle(frame, (rx, ry-th-6), (rx+tw+6, ry), (0, 0, 0), -1)
     cv2.putText(frame, label, (rx+3, ry-5), cv2.FONT_HERSHEY_SIMPLEX, font_s, (0, 255, 0), thickness)
 
-    # 4. Draw Graph Box
-    # Ensure iy is valid
-    iy = int(cy_local)
+    # GRAPH DRAWING
+    # CRITICAL FIX: Use peak_coords[1] (y-coord of max bright pixel) 
+    # instead of centroid to ensure graph slice actually hits the star
+    iy = int(peak_coords[1])
+    
     if iy >= 0 and iy < roi_img.shape[0]:
         row_data = roi_img[iy, :]
         
-        # Black Background for Graph
+        # Black Background
         cv2.rectangle(frame, (g_x, g_y), (g_x+g_w, g_y+g_h), (0,0,0), -1)
         cv2.rectangle(frame, (g_x, g_y), (g_x+g_w, g_y+g_h), (50,50,50), 1)
         
-        # SMART AUTO-SCALE
-        # Calculate dynamic range of the row
         r_min, r_max = np.min(row_data), np.max(row_data)
         r_range = r_max - r_min
-        
-        # Threshold: 15 ADU (prevents magnifying pure noise)
         NOISE_THRESHOLD = 15
         
         pts = []
         for x, val in enumerate(row_data):
-            # Scale X to new width g_w
             px = int(g_x + (x / len(row_data)) * g_w)
-            
-            # SCALING LOGIC
             if r_range > NOISE_THRESHOLD:
-                # Star Detected: Stretch min-max to full height (0.0 to 1.0)
                 norm_h = (val - r_min) / r_range
                 py = int((g_y + g_h) - (norm_h * g_h))
             else:
-                # Noise Only: Scale using a fixed floor (255) to keep it flat
                 norm_h = val / 255.0 
                 py = int((g_y + g_h) - (norm_h * g_h))
-                
             pts.append((px, py))
             
         if len(pts) > 1:
-            # Color logic: Yellow if star, Blue if noise
             color = (0, 255, 255) if r_range > NOISE_THRESHOLD else (255, 100, 0)
             cv2.polylines(frame, [np.array(pts)], False, color, 1)
         
@@ -566,9 +550,10 @@ def generate_frames():
             
             if rw > 10 and rh > 10 and rx+rw < w and ry+rh < h:
                 roi_gray = frame[ry:ry+rh, rx:rx+rw] if len(frame.shape)==2 else cv2.cvtColor(color_frame[ry:ry+rh, rx:rx+rw], cv2.COLOR_RGB2GRAY)
-                hfd, cent = calculate_hfd(roi_gray)
+                # UPDATED UNPACKING
+                hfd, cent, peak = calculate_hfd(roi_gray)
                 hfd_history.append(hfd)
-                draw_overlays(color_frame, roi_gray, hfd, cent, (rx, ry, rw, rh), current_state)
+                draw_overlays(color_frame, roi_gray, hfd, cent, peak, (rx, ry, rw, rh), current_state)
 
         ret, buffer = cv2.imencode('.jpg', color_frame)
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
