@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer (v12.3 - HFD Low-Light Fix)
+# ZWO ASI Camera Streamer (v13.0 - Auto-Star Selection)
 # ==============================================================================
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v12.3)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v13.0)...${NC}"
 
 # --- 1. System Dependencies ---
 if ! dpkg -s libopencv-dev >/dev/null 2>&1; then
@@ -83,9 +83,6 @@ HTML_TEMPLATE = """
         #transform-layer { position: relative; transform-origin: center center; transition: transform 0.1s ease-out; will-change: transform; }
         #video-feed { display: block; max-width: 100vw; max-height: 100vh; object-fit: contain; pointer-events: none; }
         
-        #interaction-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 10; }
-        #selection-box { position: absolute; border: 2px dashed rgba(0, 255, 0, 0.9); background: rgba(0, 255, 0, 0.1); display: none; z-index: 20; pointer-events: none; }
-
         #ui-layer { position: fixed; top: 10px; left: 10px; z-index: 100; width: 340px; max-width: 95vw; pointer-events: none; }
         
         .controls { 
@@ -109,7 +106,8 @@ HTML_TEMPLATE = """
         input[type=range] { width: 100%; height: 6px; background: #444; border-radius: 3px; -webkit-appearance: none; }
         input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; background: #d32f2f; border-radius: 50%; }
         
-        .tool-btn { flex: 1; padding: 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; color: white; }
+        .tool-btn { width: 100%; padding: 12px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; color: white; background: #0277bd; margin-top: 5px; }
+        .tool-btn:active { background: #01579b; }
 
         /* History Graph Canvas */
         #graph-container { background: #111; border: 1px solid #444; border-radius: 4px; margin-bottom: 15px; padding: 5px; }
@@ -121,9 +119,6 @@ HTML_TEMPLATE = """
     <div id="viewport">
         <div id="transform-layer">
             <img id="video-feed" src="/video_feed">
-            <div id="interaction-layer">
-                <div id="selection-box"></div>
-            </div>
         </div>
     </div>
 
@@ -176,25 +171,14 @@ HTML_TEMPLATE = """
             <hr style="border-color: #333; margin: 15px 0;">
             
             <div class="control-group">
-                <label style="margin-bottom: 8px;">Interaction Mode</label>
-                <div style="display: flex; gap: 10px;">
-                    <button class="tool-btn" id="btn-select" onclick="setTool('select')" style="background: #d32f2f;">◻ Select Star</button>
-                    <button class="tool-btn" id="btn-pan" onclick="setTool('pan')" style="background: #444;">✋ Pan Image</button>
-                </div>
+                <button class="tool-btn" onclick="triggerAutoSelect()">🎯 Auto-Select Star</button>
             </div>
         </div>
     </div>
 
     <script>
-        const layer = document.getElementById('interaction-layer');
         const transformLayer = document.getElementById('transform-layer');
-        const selBox = document.getElementById('selection-box');
-        
-        let currentTool = 'select';
         let zoomLevel = 1.0;
-        let panX = 0, panY = 0;
-        let startX, startY;
-        let isDragging = false;
         
         // --- Graphing Logic ---
         const canvas = document.getElementById('historyGraph');
@@ -244,97 +228,10 @@ HTML_TEMPLATE = """
         }
         setInterval(fetchStatus, 1000);
 
-        // --- Interaction Logic ---
-        layer.addEventListener('touchstart', handleStart, {passive: false});
-        layer.addEventListener('mousedown', handleStart);
-        layer.addEventListener('touchmove', handleMove, {passive: false});
-        layer.addEventListener('mousemove', handleMove);
-        layer.addEventListener('touchend', handleEnd);
-        layer.addEventListener('mouseup', handleEnd);
-        layer.addEventListener('dblclick', clearSelection);
-
-        function setTool(t) {
-            currentTool = t;
-            document.getElementById('btn-select').style.background = t==='select'?'#d32f2f':'#444';
-            document.getElementById('btn-pan').style.background = t==='pan'?'#d32f2f':'#444';
-            layer.style.cursor = t==='select'?'crosshair':'grab';
-        }
-
         function updateZoom(val) {
             zoomLevel = val / 10.0;
             document.getElementById('val-zoom').innerText = zoomLevel.toFixed(1) + 'x';
-            applyTransform();
-        }
-
-        function applyTransform() {
-            transformLayer.style.transform = `scale(${zoomLevel}) translate(${panX}px, ${panY}px)`;
-        }
-
-        function handleStart(e) {
-            e.preventDefault();
-            const pt = getPoint(e);
-            startX = pt.x; startY = pt.y;
-            isDragging = true;
-
-            if(currentTool === 'select') {
-                selBox.style.display = 'block';
-                selBox.style.width = '0px'; selBox.style.height = '0px';
-                let local = getLocalCoords(e);
-                selBox.dataset.ox = local.x; selBox.dataset.oy = local.y;
-                selBox.style.left = local.x + 'px'; selBox.style.top = local.y + 'px';
-            }
-        }
-
-        function handleMove(e) {
-            if(!isDragging) return;
-            e.preventDefault();
-            const pt = getPoint(e);
-
-            if(currentTool === 'pan') {
-                panX += (pt.x - startX) / zoomLevel;
-                panY += (pt.y - startY) / zoomLevel;
-                startX = pt.x; startY = pt.y;
-                applyTransform();
-            } else {
-                let local = getLocalCoords(e);
-                let ox = parseFloat(selBox.dataset.ox);
-                let oy = parseFloat(selBox.dataset.oy);
-                selBox.style.width = Math.abs(local.x - ox) + 'px';
-                selBox.style.height = Math.abs(local.y - oy) + 'px';
-                selBox.style.left = Math.min(local.x, ox) + 'px';
-                selBox.style.top = Math.min(local.y, oy) + 'px';
-            }
-        }
-
-        function handleEnd(e) {
-            if(!isDragging) return;
-            isDragging = false;
-            
-            if(currentTool === 'select') {
-                const w = parseFloat(selBox.style.width);
-                const h = parseFloat(selBox.style.height);
-                const l = parseFloat(selBox.style.left);
-                const t = parseFloat(selBox.style.top);
-                
-                selBox.style.display = 'none';
-                if(w < 10 || h < 10) return;
-
-                const roi = {
-                    x: l / layer.offsetWidth,
-                    y: t / layer.offsetHeight,
-                    w: w / layer.offsetWidth,
-                    h: h / layer.offsetHeight
-                };
-                fetch('/update_roi', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(roi)});
-            }
-        }
-
-        function getPoint(e) { return e.touches ? {x:e.touches[0].clientX, y:e.touches[0].clientY} : {x:e.clientX, y:e.clientY}; }
-        
-        function getLocalCoords(e) {
-            const rect = layer.getBoundingClientRect();
-            const pt = getPoint(e);
-            return {x: (pt.x - rect.left)/zoomLevel, y: (pt.y - rect.top)/zoomLevel};
+            transformLayer.style.transform = `scale(${zoomLevel})`;
         }
         
         // Settings Logic
@@ -385,8 +282,7 @@ HTML_TEMPLATE = """
             });
         }
         
-        function clearSelection() {
-            selBox.style.display = 'none';
+        function triggerAutoSelect() {
             fetch('/update_roi', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({clear: true})});
         }
         
@@ -413,9 +309,6 @@ def calculate_hfd(roi_img):
         star_data[star_data < 0] = 0
         
         # 2. Dynamic Threshold + Hard Floor
-        # We need a relative threshold (20% of peak) but ALSO a hard floor (e.g., 10 ADU).
-        # Without the hard floor, a faint star (peak 20) yields a threshold of 4.
-        # Camera noise often fluctuates > 4, causing random background pixels to be counted.
         rel_thresh = (maxVal - bg) * 0.2
         abs_thresh = 10.0 
         threshold = max(rel_thresh, abs_thresh)
@@ -456,7 +349,7 @@ def draw_overlays(frame, roi_img, hfd_val, centroid, peak_coords, rect_offset, s
 
     # Draw ROI Box & HFD
     font_s = state.get('font_scale', 1.0)
-    cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 1)
+    cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
     label = f"HFD: {hfd_val:.2f}"
     thickness = 2
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_s, thickness)
@@ -547,6 +440,85 @@ def generate_frames():
         else:
             color_frame = cv2.cvtColor(frame, cv2.COLOR_BAYER_RG2RGB)
 
+        # --- AUTO STAR SELECTION ---
+        if roi_def is None:
+            # Detect star on full frame
+            if len(frame.shape)==3: gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            else: gray = frame
+            
+            h, w = gray.shape
+            
+            # 1. Blur to suppress hot pixels (High frequency noise)
+            blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+            
+            # 2. Dynamic Thresholding
+            # Find stats to separate star from sky background
+            mean_val, std_val = cv2.meanStdDev(blurred)
+            mean_val = mean_val[0][0]
+            std_val = std_val[0][0]
+            
+            # Threshold = Mean + 5 * StdDev (Aggressive to find stars)
+            thresh_val = mean_val + 5 * std_val
+            _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
+            
+            # 3. Find Contours
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            best_star = None
+            max_score = 0
+            
+            center_x, center_y = w // 2, h // 2
+            
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < 4: continue # Too small, likely noise
+                
+                x, y, bw, bh = cv2.boundingRect(c)
+                
+                # Filter out edge artifacts
+                if x < 10 or y < 10 or (x+bw) > w-10 or (y+bh) > h-10: continue
+                
+                # Score Logic: 
+                # - Prefer Larger Area (High SNR)
+                # - Prefer Centrality (Closer to center of frame)
+                cx = x + bw/2
+                cy = y + bh/2
+                dist_from_center = math.hypot(cx - center_x, cy - center_y)
+                
+                # Area weighted by distance from center
+                score = area / (1.0 + dist_from_center * 0.005)
+                
+                if score > max_score:
+                    max_score = score
+                    best_star = (cx, cy)
+            
+            # 4. Fallback (If no contours found, take brightest blurred spot)
+            if best_star is None:
+                 minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(blurred)
+                 # Only if significantly brighter than background
+                 if maxVal > mean_val + 20:
+                     best_star = maxLoc
+            
+            # 5. Apply ROI if star found
+            if best_star:
+                cx, cy = best_star
+                roi_size = 128 # Fixed ROI size
+                
+                nx = int(cx - roi_size // 2)
+                ny = int(cy - roi_size // 2)
+                
+                # Clamp to bounds
+                nx = max(0, min(nx, w - roi_size))
+                ny = max(0, min(ny, h - roi_size))
+                
+                with state_lock:
+                    cam_state['roi_norm'] = {
+                        'x': nx/w, 'y': ny/h, 
+                        'w': roi_size/w, 'h': roi_size/h
+                    }
+                    roi_def = cam_state['roi_norm']
+
+        # --- ROI PROCESSING ---
         if roi_def:
             h, w, _ = color_frame.shape
             rx = int(roi_def['x'] * w)
