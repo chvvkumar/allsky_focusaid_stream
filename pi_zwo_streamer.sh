@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer (v13.0 - Auto-Star Selection)
+# ZWO ASI Camera Streamer (v13.1 - Fixed Auto-Star Selection)
 # ==============================================================================
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v13.0)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v13.1)...${NC}"
 
 # --- 1. System Dependencies ---
 if ! dpkg -s libopencv-dev >/dev/null 2>&1; then
@@ -58,7 +58,8 @@ cam_state = {
     'exposure_mode': 'ms',
     'roi_norm': None,
     'font_scale': 1.0,      
-    'graph_height': 100     
+    'graph_height': 100,
+    'auto_select_pending': False     
 }
 state_lock = threading.Lock()
 
@@ -283,7 +284,7 @@ HTML_TEMPLATE = """
         }
         
         function triggerAutoSelect() {
-            fetch('/update_roi', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({clear: true})});
+            fetch('/trigger_auto_select', {method:'POST'});
         }
         
         document.getElementById('control-panel').style.display = 'none';
@@ -388,6 +389,94 @@ def draw_overlays(frame, roi_img, hfd_val, centroid, peak_coords, rect_offset, s
         lbl = "Profile" if r_range > NOISE_THRESHOLD else "Noise"
         cv2.putText(frame, lbl, (g_x+2, g_y+12), cv2.FONT_HERSHEY_PLAIN, 0.8, (150,150,150), 1)
 
+def auto_select_star(frame, target_us):
+    """Perform star auto-selection with current exposure settings"""
+    # Detect star on full frame
+    if len(frame.shape)==3: gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else: gray = frame
+    
+    h, w = gray.shape
+    
+    # 1. Blur to suppress hot pixels (High frequency noise)
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+    
+    # 2. IMPROVED Dynamic Thresholding
+    mean_val, std_val = cv2.meanStdDev(blurred)
+    mean_val = mean_val[0][0]
+    std_val = std_val[0][0]
+    
+    # Use percentile-based threshold for better robustness across different exposures
+    sorted_pixels = np.sort(blurred.flatten())
+    p99 = sorted_pixels[int(len(sorted_pixels) * 0.99)]
+    p95 = sorted_pixels[int(len(sorted_pixels) * 0.95)]
+    
+    # Adaptive threshold combining multiple methods
+    stat_thresh = mean_val + 3.5 * std_val
+    perc_thresh = p95 + (p99 - p95) * 0.3
+    thresh_val = max(stat_thresh, perc_thresh, mean_val + 12)
+    
+    _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
+    
+    # 3. Find Contours
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    best_star = None
+    max_score = 0
+    
+    center_x, center_y = w // 2, h // 2
+    
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 4 or area > 5000: continue  # Filter noise and over-exposed regions
+        
+        x, y, bw, bh = cv2.boundingRect(c)
+        
+        # Filter out edge artifacts
+        if x < 10 or y < 10 or (x+bw) > w-10 or (y+bh) > h-10: continue
+        
+        # Check aspect ratio - stars should be roughly circular
+        aspect_ratio = max(bw, bh) / max(min(bw, bh), 1)
+        if aspect_ratio > 3.0: continue  # Too elongated
+        
+        # Score Logic with improved weighting
+        cx = x + bw/2
+        cy = y + bh/2
+        dist_from_center = math.hypot(cx - center_x, cy - center_y)
+        
+        # Bonus for roundness
+        circularity = 1.0 / aspect_ratio
+        score = (area * circularity) / (1.0 + dist_from_center * 0.005)
+        
+        if score > max_score:
+            max_score = score
+            best_star = (int(cx), int(cy))
+    
+    # 4. IMPROVED Fallback
+    if best_star is None:
+        minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(blurred)
+        brightness_ratio = maxVal / max(mean_val, 1)
+        if brightness_ratio > 1.3:  # At least 30% brighter than mean
+            best_star = maxLoc
+    
+    # 5. Apply ROI if star found
+    if best_star:
+        cx, cy = best_star
+        roi_size = 128  # Fixed ROI size
+        
+        nx = int(cx - roi_size // 2)
+        ny = int(cy - roi_size // 2)
+        
+        # Clamp to bounds
+        nx = max(0, min(nx, w - roi_size))
+        ny = max(0, min(ny, h - roi_size))
+        
+        return {
+            'x': nx/w, 'y': ny/h, 
+            'w': roi_size/w, 'h': roi_size/h
+        }
+    
+    return None
+
 # ================= VIDEO LOOP =================
 
 def generate_frames():
@@ -407,6 +496,7 @@ def generate_frames():
 
     applied_gain = -1
     applied_exp = -1
+    frames_since_exp_change = 0
 
     while True:
         with state_lock:
@@ -416,6 +506,7 @@ def generate_frames():
         exp_val = current_state['exposure_val']
         exp_mode = current_state['exposure_mode']
         roi_def = current_state['roi_norm']
+        auto_select = current_state.get('auto_select_pending', False)
         
         try:
             if gain != applied_gain:
@@ -428,6 +519,9 @@ def generate_frames():
             if target_us != applied_exp:
                 camera.set_control_value(asi.ASI_EXPOSURE, target_us)
                 applied_exp = target_us
+                frames_since_exp_change = 0  # Reset counter
+            else:
+                frames_since_exp_change += 1
         except: pass
 
         try:
@@ -441,82 +535,13 @@ def generate_frames():
             color_frame = cv2.cvtColor(frame, cv2.COLOR_BAYER_RG2RGB)
 
         # --- AUTO STAR SELECTION ---
-        if roi_def is None:
-            # Detect star on full frame
-            if len(frame.shape)==3: gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            else: gray = frame
-            
-            h, w = gray.shape
-            
-            # 1. Blur to suppress hot pixels (High frequency noise)
-            blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-            
-            # 2. Dynamic Thresholding
-            # Find stats to separate star from sky background
-            mean_val, std_val = cv2.meanStdDev(blurred)
-            mean_val = mean_val[0][0]
-            std_val = std_val[0][0]
-            
-            # Threshold = Mean + 5 * StdDev (Aggressive to find stars)
-            thresh_val = mean_val + 5 * std_val
-            _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
-            
-            # 3. Find Contours
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            best_star = None
-            max_score = 0
-            
-            center_x, center_y = w // 2, h // 2
-            
-            for c in contours:
-                area = cv2.contourArea(c)
-                if area < 4: continue # Too small, likely noise
-                
-                x, y, bw, bh = cv2.boundingRect(c)
-                
-                # Filter out edge artifacts
-                if x < 10 or y < 10 or (x+bw) > w-10 or (y+bh) > h-10: continue
-                
-                # Score Logic: 
-                # - Prefer Larger Area (High SNR)
-                # - Prefer Centrality (Closer to center of frame)
-                cx = x + bw/2
-                cy = y + bh/2
-                dist_from_center = math.hypot(cx - center_x, cy - center_y)
-                
-                # Area weighted by distance from center
-                score = area / (1.0 + dist_from_center * 0.005)
-                
-                if score > max_score:
-                    max_score = score
-                    best_star = (cx, cy)
-            
-            # 4. Fallback (If no contours found, take brightest blurred spot)
-            if best_star is None:
-                 minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(blurred)
-                 # Only if significantly brighter than background
-                 if maxVal > mean_val + 20:
-                     best_star = maxLoc
-            
-            # 5. Apply ROI if star found
-            if best_star:
-                cx, cy = best_star
-                roi_size = 128 # Fixed ROI size
-                
-                nx = int(cx - roi_size // 2)
-                ny = int(cy - roi_size // 2)
-                
-                # Clamp to bounds
-                nx = max(0, min(nx, w - roi_size))
-                ny = max(0, min(ny, h - roi_size))
-                
-                with state_lock:
-                    cam_state['roi_norm'] = {
-                        'x': nx/w, 'y': ny/h, 
-                        'w': roi_size/w, 'h': roi_size/h
-                    }
-                    roi_def = cam_state['roi_norm']
+        # Only perform auto-selection after camera has stabilized (wait 3 frames)
+        if auto_select and frames_since_exp_change >= 3:
+            result = auto_select_star(frame, target_us)
+            with state_lock:
+                cam_state['roi_norm'] = result
+                cam_state['auto_select_pending'] = False
+            roi_def = result
 
         # --- ROI PROCESSING ---
         if roi_def:
@@ -528,7 +553,6 @@ def generate_frames():
             
             if rw > 10 and rh > 10 and rx+rw < w and ry+rh < h:
                 roi_gray = frame[ry:ry+rh, rx:rx+rw] if len(frame.shape)==2 else cv2.cvtColor(color_frame[ry:ry+rh, rx:rx+rw], cv2.COLOR_RGB2GRAY)
-                # UPDATED UNPACKING
                 hfd, cent, peak = calculate_hfd(roi_gray)
                 hfd_history.append(hfd)
                 draw_overlays(color_frame, roi_gray, hfd, cent, peak, (rx, ry, rw, rh), current_state)
@@ -557,11 +581,20 @@ def update_settings():
         if 'graph_height' in d: cam_state['graph_height'] = int(d['graph_height'])
     return jsonify({"status":"ok"})
 
+@app.route('/trigger_auto_select', methods=['POST'])
+def trigger_auto_select():
+    with state_lock:
+        cam_state['roi_norm'] = None
+        cam_state['auto_select_pending'] = True
+    return jsonify({"status":"ok"})
+
 @app.route('/update_roi', methods=['POST'])
 def update_roi():
     d = request.json
     with state_lock:
-        if 'clear' in d: cam_state['roi_norm'] = None
+        if 'clear' in d: 
+            cam_state['roi_norm'] = None
+            cam_state['auto_select_pending'] = False
         else: cam_state['roi_norm'] = {
             'x': float(d['x']), 'y': float(d['y']),
             'w': float(d['w']), 'h': float(d['h'])
