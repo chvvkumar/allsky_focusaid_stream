@@ -390,7 +390,7 @@ def draw_overlays(frame, roi_img, hfd_val, centroid, peak_coords, rect_offset, s
         cv2.putText(frame, lbl, (g_x+2, g_y+12), cv2.FONT_HERSHEY_PLAIN, 0.8, (150,150,150), 1)
 
 def auto_select_star(frame, target_us):
-    """Perform star auto-selection with current exposure settings"""
+    """Perform star auto-selection with enhanced validation to ensure actual stars are selected"""
     # Detect star on full frame
     if len(frame.shape)==3: gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     else: gray = frame
@@ -420,9 +420,7 @@ def auto_select_star(frame, target_us):
     # 3. Find Contours
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    best_star = None
-    max_score = 0
-    
+    candidates = []
     center_x, center_y = w // 2, h // 2
     
     for c in contours:
@@ -438,27 +436,108 @@ def auto_select_star(frame, target_us):
         aspect_ratio = max(bw, bh) / max(min(bw, bh), 1)
         if aspect_ratio > 3.0: continue  # Too elongated
         
-        # Score Logic with improved weighting
-        cx = x + bw/2
-        cy = y + bh/2
+        # Extract small region around candidate
+        cx = int(x + bw/2)
+        cy = int(y + bh/2)
+        
+        # Create test ROI (larger than contour to test PSF)
+        test_size = max(bw, bh) * 3
+        test_size = min(int(test_size), 64)  # Cap at 64 pixels
+        tx = max(0, int(cx - test_size // 2))
+        ty = max(0, int(cy - test_size // 2))
+        test_size = min(test_size, w - tx, h - ty)
+        
+        if test_size < 8: continue
+        
+        test_roi = gray[ty:ty+test_size, tx:tx+test_size]
+        
+        # STAR VALIDATION - Check for proper PSF characteristics
+        # A real star should have:
+        # 1. Clear peak brightness
+        # 2. Gradual falloff from center
+        # 3. Not be a saturated blob
+        
+        roi_min, roi_max, roi_minLoc, roi_maxLoc = cv2.minMaxLoc(test_roi)
+        roi_mean = np.mean(test_roi)
+        
+        # Check if too saturated (likely over-exposed or hot pixel)
+        if roi_max >= 250:
+            continue
+        
+        # Check dynamic range (stars should have good contrast)
+        dynamic_range = roi_max - roi_mean
+        if dynamic_range < 15:
+            continue
+        
+        # Check peak position (should be relatively centered in the test ROI)
+        peak_x_offset = abs(roi_maxLoc[0] - test_size/2) / (test_size/2)
+        peak_y_offset = abs(roi_maxLoc[1] - test_size/2) / (test_size/2)
+        if peak_x_offset > 0.6 or peak_y_offset > 0.6:
+            continue
+        
+        # Calculate gradient falloff (stars should have smooth gradient)
+        bg_estimate = np.median(test_roi)
+        above_bg = test_roi.astype(float) - bg_estimate
+        above_bg[above_bg < 0] = 0
+        
+        # Check if there's a concentrated bright region
+        bright_pixels = np.sum(above_bg > dynamic_range * 0.5)
+        if bright_pixels < 3 or bright_pixels > test_size * test_size * 0.3:
+            continue
+        
+        # Circularity bonus
+        circularity = 1.0 / aspect_ratio
+        
+        # Distance from center penalty
         dist_from_center = math.hypot(cx - center_x, cy - center_y)
         
-        # Bonus for roundness
-        circularity = 1.0 / aspect_ratio
-        score = (area * circularity) / (1.0 + dist_from_center * 0.005)
+        # Combined score favoring:
+        # - Good dynamic range
+        # - Reasonable size
+        # - Circular shape
+        # - Central location
+        score = (dynamic_range * 0.5 + area * 0.1) * circularity / (1.0 + dist_from_center * 0.003)
         
-        if score > max_score:
-            max_score = score
-            best_star = (int(cx), int(cy))
+        candidates.append({
+            'pos': (cx, cy),
+            'score': score,
+            'area': area,
+            'dynamic_range': dynamic_range
+        })
     
-    # 4. IMPROVED Fallback
+    # 4. Select best candidate
+    best_star = None
+    if candidates:
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        best_star = candidates[0]['pos']
+    
+    # 5. VALIDATED Fallback - only if we find something star-like
     if best_star is None:
+        # Try to find the brightest well-behaved region
         minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(blurred)
-        brightness_ratio = maxVal / max(mean_val, 1)
-        if brightness_ratio > 1.3:  # At least 30% brighter than mean
-            best_star = maxLoc
+        
+        # Extract region around brightest pixel
+        test_size = 32
+        tx = max(0, int(maxLoc[0] - test_size // 2))
+        ty = max(0, int(maxLoc[1] - test_size // 2))
+        tx = min(tx, w - test_size)
+        ty = min(ty, h - test_size)
+        
+        if tx >= 0 and ty >= 0:
+            test_roi = gray[ty:ty+test_size, tx:tx+test_size]
+            roi_mean = np.mean(test_roi)
+            
+            # Only use if it's:
+            # 1. Significantly brighter than mean
+            # 2. Not saturated
+            # 3. Has reasonable dynamic range
+            brightness_ratio = maxVal / max(mean_val, 1)
+            dynamic_range = maxVal - roi_mean
+            
+            if brightness_ratio > 1.5 and maxVal < 250 and dynamic_range > 20:
+                best_star = maxLoc
     
-    # 5. Apply ROI if star found
+    # 6. Apply ROI if star found
     if best_star:
         cx, cy = best_star
         roi_size = 128  # Fixed ROI size
