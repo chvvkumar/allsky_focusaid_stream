@@ -9,7 +9,7 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v10)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v11)...${NC}"
 
 # --- 1. System Dependencies Check ---
 if ! dpkg -s libopencv-dev >/dev/null 2>&1; then
@@ -484,9 +484,9 @@ def draw_overlays(frame, roi_img, hfd_val, centroid, rect_offset, state):
         
         # Plot
         pts = []
-        # Normalizing to max value in the row to fill the graph height
-        row_max = np.max(row_data)
-        scale_max = row_max if row_max > 0 else 255
+        # UPDATED: Fixed scale to max possible 8-bit value (255)
+        # This prevents background noise from being auto-scaled to fill the whole graph.
+        scale_max = 255.0
         
         for x, val in enumerate(row_data):
             px = int(g_x + (x/len(row_data))*g_w)
