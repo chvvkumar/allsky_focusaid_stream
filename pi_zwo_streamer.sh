@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer v9 (UI Graph, Text Size, Graph Height)
+# ZWO ASI Camera Streamer 
 # ==============================================================================
 
 GREEN='\033[0;32m'
@@ -9,7 +9,7 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v9)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v10)...${NC}"
 
 # --- 1. System Dependencies Check ---
 if ! dpkg -s libopencv-dev >/dev/null 2>&1; then
@@ -59,7 +59,7 @@ cam_state = {
     'exposure_mode': 'ms',
     'roi_norm': None,
     'font_scale': 1.0,      # Text Size
-    'graph_height': 60      # Profile Graph Height (px)
+    'graph_height': 60      # Now treated as Aspect Ratio % (60 = 0.6)
 }
 state_lock = threading.Lock()
 
@@ -171,7 +171,7 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="control-group">
-                <label>Profile Graph Height <span id="val-gheight" class="val-display">60px</span></label>
+                <label>Profile Graph Ratio <span id="val-gheight" class="val-display">60%</span></label>
                 <input type="range" id="rng-gheight" min="20" max="200" value="60" oninput="updateVal('gheight', this.value)" onchange="sendSettings()">
             </div>
             
@@ -217,8 +217,10 @@ HTML_TEMPLATE = """
             
             if(data.length < 2) return;
             
-            const maxVal = Math.max(...data, 10);
-            const minVal = Math.min(...data); // Optional: scale from 0 or min? using 0 for HFD is safer
+            const maxVal = Math.max(...data);
+            const minVal = Math.min(...data); 
+            // Scale range: show a bit of buffer above max
+            const displayMax = maxVal * 1.1; 
             
             ctx.beginPath();
             ctx.strokeStyle = '#00e5ff';
@@ -227,16 +229,28 @@ HTML_TEMPLATE = """
             data.forEach((val, i) => {
                 const x = (i / (data.length - 1)) * w;
                 // Invert Y so 0 is at bottom
-                const y = h - ((val / (maxVal * 1.1)) * h); 
+                const y = h - ((val / displayMax) * h); 
                 if (i===0) ctx.moveTo(x, y);
                 else ctx.lineTo(x, y);
             });
             ctx.stroke();
             
-            // Draw current value text
+            // Draw Stats
+            ctx.font = '11px monospace';
+            
+            // Current (Top Right)
             ctx.fillStyle = '#fff';
-            ctx.font = '12px sans-serif';
-            ctx.fillText(data[data.length-1].toFixed(2), w - 40, 15);
+            ctx.textAlign = 'right';
+            ctx.fillText("Cur: " + data[data.length-1].toFixed(2), w - 5, 12);
+            
+            // Min (Green, Bottom Left)
+            ctx.fillStyle = '#0f0';
+            ctx.textAlign = 'left';
+            ctx.fillText("Min: " + minVal.toFixed(2), 5, h - 5);
+            
+            // Max (Red, Top Left)
+            ctx.fillStyle = '#f55';
+            ctx.fillText("Max: " + maxVal.toFixed(2), 5, 12);
         }
         
         function fetchStatus() {
@@ -370,7 +384,7 @@ HTML_TEMPLATE = """
 
         function updateVal(k, v) {
             if(k === 'font') document.getElementById('val-'+k).innerText = (v/10.0).toFixed(1);
-            else if(k === 'gheight') document.getElementById('val-'+k).innerText = v + 'px';
+            else if(k === 'gheight') document.getElementById('val-'+k).innerText = v + '%'; // Updated label unit
             else document.getElementById('val-'+k).innerText = v + (k==='exp' ? (expMode==='ms'?' ms':' µs') : '');
             
             if(k === 'gain') settings.gain = parseInt(v);
@@ -442,7 +456,12 @@ def draw_overlays(frame, roi_img, hfd_val, centroid, rect_offset, state):
     rx, ry, rw, rh = rect_offset
     cx_local, cy_local = centroid
     font_s = state.get('font_scale', 1.0)
-    g_h = state.get('graph_height', 60)
+    
+    # NEW: Calculate proportional graph height
+    # Slider 60 means 60% of ROI width. 
+    ratio_pct = state.get('graph_height', 60) 
+    g_h = int(rw * (ratio_pct / 100.0))
+    g_h = max(20, g_h) # safety min height
     
     # 1. HFD Box & Label
     cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 1)
