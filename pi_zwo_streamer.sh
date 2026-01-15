@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer (v12 - Smart Graph)
+# ZWO ASI Camera Streamer (v12.1 - Scalable Graph)
 # ==============================================================================
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v12)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v12.1)...${NC}"
 
 # --- 1. System Dependencies ---
 if ! dpkg -s libopencv-dev >/dev/null 2>&1; then
@@ -58,7 +58,7 @@ cam_state = {
     'exposure_mode': 'ms',
     'roi_norm': None,
     'font_scale': 1.0,      
-    'graph_height': 100     # NOW IN PIXELS (Not ratio)
+    'graph_height': 100     # Controls size (height, with locked aspect ratio)
 }
 state_lock = threading.Lock()
 
@@ -169,7 +169,7 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="control-group">
-                <label>Graph Height <span id="val-gheight" class="val-display">100px</span></label>
+                <label>Graph Size <span id="val-gheight" class="val-display">100px</span></label>
                 <input type="range" id="rng-gheight" min="40" max="300" value="100" oninput="updateVal('gheight', this.value)" onchange="sendSettings()">
             </div>
             
@@ -431,16 +431,19 @@ def draw_overlays(frame, roi_img, hfd_val, centroid, rect_offset, state):
     cx_local, cy_local = centroid
     font_s = state.get('font_scale', 1.0)
     
-    # 1. Box Scaling
+    # 1. Box Scaling (New: Maintains Aspect Ratio)
     g_h = state.get('graph_height', 100)
-    g_w = rw
+    # Scale width with height (Aspect Ratio ~1.5)
+    g_w = int(g_h * 1.5)
     
-    # 2. Collision Detection (Flip Logic)
-    # Check if graph falls off the bottom of the image
+    # 2. Collision Detection (Flip Logic & Centering)
     img_h, img_w, _ = frame.shape
     
-    # Default: Below ROI
-    g_x = rx
+    # Horizontal: Center graph relative to ROI, then clamp to screen
+    g_x = rx + (rw // 2) - (g_w // 2)
+    g_x = max(0, min(g_x, img_w - g_w))
+    
+    # Vertical: Default Below
     g_y = ry + rh + 5
     
     # If it falls off bottom, put it ABOVE ROI
@@ -479,6 +482,7 @@ def draw_overlays(frame, roi_img, hfd_val, centroid, rect_offset, state):
         
         pts = []
         for x, val in enumerate(row_data):
+            # Scale X to new width g_w
             px = int(g_x + (x / len(row_data)) * g_w)
             
             # SCALING LOGIC
