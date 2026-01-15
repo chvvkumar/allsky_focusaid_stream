@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer (v12.2 - Peak Graph Fix)
+# ZWO ASI Camera Streamer (v12.3 - HFD Low-Light Fix)
 # ==============================================================================
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v12.2)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v12.3)...${NC}"
 
 # --- 1. System Dependencies ---
 if ! dpkg -s libopencv-dev >/dev/null 2>&1; then
@@ -403,15 +403,23 @@ def calculate_hfd(roi_img):
         blurred = cv2.GaussianBlur(roi_img, (3, 3), 0)
         minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(blurred)
         
-        # Returns peak_coords as the 3rd argument
         if maxVal < 5: return 0.0, maxLoc, maxLoc
 
         bg = np.median(roi_img)
         star_data = roi_img.astype(float) - bg
         
-        # NOISE GATE: Ignore pixels dimmer than 20% of the peak range
-        # This prevents background noise from destroying HFD calc
-        threshold = (maxVal - bg) * 0.2
+        # --- FIX: ROBUST NOISE GATE ---
+        # 1. Clip negative values (where pixel < background)
+        star_data[star_data < 0] = 0
+        
+        # 2. Dynamic Threshold + Hard Floor
+        # We need a relative threshold (20% of peak) but ALSO a hard floor (e.g., 10 ADU).
+        # Without the hard floor, a faint star (peak 20) yields a threshold of 4.
+        # Camera noise often fluctuates > 4, causing random background pixels to be counted.
+        rel_thresh = (maxVal - bg) * 0.2
+        abs_thresh = 10.0 
+        threshold = max(rel_thresh, abs_thresh)
+        
         star_data[star_data < threshold] = 0
         
         m = cv2.moments(star_data)
@@ -456,8 +464,6 @@ def draw_overlays(frame, roi_img, hfd_val, centroid, peak_coords, rect_offset, s
     cv2.putText(frame, label, (rx+3, ry-5), cv2.FONT_HERSHEY_SIMPLEX, font_s, (0, 255, 0), thickness)
 
     # GRAPH DRAWING
-    # CRITICAL FIX: Use peak_coords[1] (y-coord of max bright pixel) 
-    # instead of centroid to ensure graph slice actually hits the star
     iy = int(peak_coords[1])
     
     if iy >= 0 and iy < roi_img.shape[0]:
