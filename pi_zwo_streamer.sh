@@ -41,7 +41,7 @@ fi
 # --- 5. Generate Python Script ---
 cat << 'EOF' > zwo.py
 #!/usr/bin/env python3
-import sys, os, time, threading, json, math
+import sys, os, time, threading, json, math, signal
 from collections import deque
 import cv2
 import numpy as np
@@ -1025,7 +1025,19 @@ def clear_roi_area():
         cam_state['roi_selection_area'] = None
     return jsonify({"status":"ok"})
 
+def _shutdown(signum, frame):
+    print("\nShutting down...")
+    try:
+        if camera:
+            camera.stop_video_capture()
+            camera.close()
+    except Exception:
+        pass
+    os._exit(0)
+
 if __name__ == '__main__':
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
     app.run(host='0.0.0.0', port=5000, threaded=True)
 EOF
 
