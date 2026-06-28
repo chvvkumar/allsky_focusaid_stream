@@ -84,7 +84,17 @@ HTML_TEMPLATE = """
         #viewport { position: fixed; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; background: #111; overflow: hidden; }
         #transform-layer { position: relative; transform-origin: center center; transition: transform 0.1s ease-out; will-change: transform; }
         #video-feed { display: block; max-width: 100vw; max-height: 100vh; object-fit: contain; pointer-events: none; }
-        
+
+        #zoom-controls { position: fixed; bottom: 15px; right: 15px; z-index: 100; display: flex; flex-direction: column; gap: 8px; align-items: center; }
+        #zoom-controls button {
+            pointer-events: auto; width: 48px; height: 48px; border-radius: 50%;
+            border: 1px solid rgba(255,255,255,0.15); background: rgba(20,20,20,0.9);
+            backdrop-filter: blur(8px); color: #eee; font-size: 24px; font-weight: bold;
+            cursor: pointer; line-height: 1; display: flex; align-items: center; justify-content: center;
+        }
+        #zoom-controls button:active { background: rgba(211,47,47,0.9); }
+        #zoom-label { pointer-events: none; font-size: 11px; color: #d32f2f; font-weight: bold; font-family: monospace; background: rgba(20,20,20,0.9); border-radius: 10px; padding: 2px 8px; }
+
         #ui-layer { position: fixed; top: 10px; left: 10px; z-index: 100; width: 340px; max-width: 95vw; pointer-events: none; }
         
         .controls { 
@@ -213,6 +223,14 @@ HTML_TEMPLATE = """
         </div>
     </div>
     
+    <!-- Floating Zoom Controls -->
+    <div id="zoom-controls">
+        <button onclick="stepZoom(5)" title="Zoom in" aria-label="Zoom in">+</button>
+        <div id="zoom-label">1.0x</div>
+        <button onclick="stepZoom(-5)" title="Zoom out" aria-label="Zoom out">&minus;</button>
+        <button onclick="resetZoom()" title="Reset zoom" aria-label="Reset zoom" style="font-size:20px;">&#10227;</button>
+    </div>
+
     <!-- ROI Selection Overlay -->
     <div id="roi-selection-overlay">
         <div id="roi-hint">Click and drag to select ROI area<br><small>Press ESC to cancel</small></div>
@@ -273,9 +291,19 @@ HTML_TEMPLATE = """
 
         function updateZoom(val) {
             zoomLevel = val / 10.0;
-            document.getElementById('val-zoom').innerText = zoomLevel.toFixed(1) + 'x';
+            const label = zoomLevel.toFixed(1) + 'x';
+            document.getElementById('val-zoom').innerText = label;
+            document.getElementById('zoom-label').innerText = label;
+            document.getElementById('rng-zoom').value = val;
             transformLayer.style.transform = `scale(${zoomLevel})`;
         }
+
+        function stepZoom(delta) {
+            const v = Math.max(10, Math.min(100, parseInt(document.getElementById('rng-zoom').value) + delta));
+            updateZoom(v);
+        }
+
+        function resetZoom() { updateZoom(10); }
         
         // Settings Logic
         let settings = {gain: 300, exp: 100, font: 10, gheight: 100};
