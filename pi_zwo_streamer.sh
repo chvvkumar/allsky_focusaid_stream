@@ -289,13 +289,28 @@ HTML_TEMPLATE = """
         }
         setInterval(fetchStatus, 1000);
 
+        let panX = 0, panY = 0;
+
+        function applyTransform() {
+            transformLayer.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`;
+        }
+
+        function clampPan() {
+            const r = document.getElementById('video-feed').getBoundingClientRect();
+            const maxX = Math.max(0, (r.width - window.innerWidth) / 2);
+            const maxY = Math.max(0, (r.height - window.innerHeight) / 2);
+            panX = Math.max(-maxX, Math.min(maxX, panX));
+            panY = Math.max(-maxY, Math.min(maxY, panY));
+        }
+
         function updateZoom(val) {
             zoomLevel = val / 10.0;
             const label = zoomLevel.toFixed(1) + 'x';
             document.getElementById('val-zoom').innerText = label;
             document.getElementById('zoom-label').innerText = label;
             document.getElementById('rng-zoom').value = val;
-            transformLayer.style.transform = `scale(${zoomLevel})`;
+            clampPan();
+            applyTransform();
         }
 
         function stepZoom(delta) {
@@ -303,7 +318,38 @@ HTML_TEMPLATE = """
             updateZoom(v);
         }
 
-        function resetZoom() { updateZoom(10); }
+        function resetZoom() { panX = 0; panY = 0; updateZoom(10); }
+
+        // Drag-to-pan (touch + mouse) when zoomed in
+        (function() {
+            const vp = document.getElementById('viewport');
+            let dragging = false, startX, startY, startPanX, startPanY;
+
+            vp.addEventListener('pointerdown', (e) => {
+                if (zoomLevel <= 1.0 || roiSelectionActive) return;
+                dragging = true;
+                startX = e.clientX; startY = e.clientY;
+                startPanX = panX; startPanY = panY;
+                transformLayer.style.transition = 'none';
+                vp.setPointerCapture(e.pointerId);
+            });
+
+            vp.addEventListener('pointermove', (e) => {
+                if (!dragging) return;
+                panX = startPanX + (e.clientX - startX);
+                panY = startPanY + (e.clientY - startY);
+                clampPan();
+                applyTransform();
+            });
+
+            function endDrag() {
+                if (!dragging) return;
+                dragging = false;
+                transformLayer.style.transition = '';
+            }
+            vp.addEventListener('pointerup', endDrag);
+            vp.addEventListener('pointercancel', endDrag);
+        })();
         
         // Settings Logic
         let settings = {gain: 300, exp: 100, font: 10, gheight: 100};
