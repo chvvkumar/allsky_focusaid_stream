@@ -41,8 +41,10 @@ fi
 # --- 5. Generate Python Script ---
 cat << 'EOF' > zwo.py
 #!/usr/bin/env python3
-import os, threading, signal
+import os, sys, threading, signal
+from collections import deque
 import cv2
+import numpy as np
 import zwoasi as asi
 from flask import Flask, Response, render_template_string, request, jsonify
 
@@ -54,8 +56,21 @@ cam_state = {
     'gain': 300,
     'exposure_val': 100,
     'exposure_mode': 'ms',
+    'focus_center': None,   # normalized {x, y} of focus box center, None = off
+    'focus_box': 0.15,      # box side as fraction of frame width
 }
 state_lock = threading.Lock()
+
+# Focus metric state (guarded by state_lock)
+focus = {'current': 0.0, 'best': 0.0}
+focus_samples = deque(maxlen=7)    # median window, kills single-frame spikes
+focus_history = deque(maxlen=50)
+
+def _reset_focus():
+    focus['current'] = 0.0
+    focus['best'] = 0.0
+    focus_samples.clear()
+    focus_history.clear()
 
 camera = None
 app = Flask(__name__)
@@ -117,6 +132,17 @@ HTML_TEMPLATE = """
         .val-display { color: #d32f2f; font-weight: bold; font-family: monospace; }
         input[type=range] { width: 100%; height: 6px; background: #444; border-radius: 3px; -webkit-appearance: none; }
         input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; background: #d32f2f; border-radius: 50%; }
+        .tool-btn { width: 100%; padding: 12px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; color: white; background: #0277bd; margin-top: 5px; }
+        .tool-btn:active { background: #01579b; }
+
+        #focus-overlay { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 100; pointer-events: none;
+            background: rgba(20,20,20,0.85); border: 1px solid rgba(255,255,255,0.15); border-radius: 12px; padding: 8px 16px;
+            color: #eee; text-align: center; font-family: monospace; }
+        #focus-pct { font-size: 56px; font-weight: bold; line-height: 1; color: #0f0; }
+        #focus-bar { width: 240px; height: 10px; background: #333; border-radius: 5px; margin: 6px auto; overflow: hidden; }
+        #focus-bar-fill { height: 100%; width: 0; background: #0f0; }
+        #focus-spark { display: block; width: 240px; height: 40px; }
+        #focus-hint { font-size: 12px; color: #aaa; }
     </style>
 </head>
 <body>
@@ -125,6 +151,13 @@ HTML_TEMPLATE = """
         <div id="transform-layer">
             <img id="video-feed" src="/video_feed">
         </div>
+    </div>
+
+    <div id="focus-overlay">
+        <div id="focus-pct">--</div>
+        <div id="focus-bar"><div id="focus-bar-fill"></div></div>
+        <canvas id="focus-spark" width="240" height="40"></canvas>
+        <div id="focus-hint">Tap stream to place focus box</div>
     </div>
 
     <div id="ui-layer">
@@ -154,6 +187,17 @@ HTML_TEMPLATE = """
             <div class="control-group">
                 <label>Exposure Time <span id="val-exp" class="val-display">100</span></label>
                 <input type="range" id="rng-exp" min="1" max="5000" value="100" oninput="updateVal('exp', this.value)" onchange="sendSettings()">
+            </div>
+
+            <hr style="border-color: #333; margin: 15px 0;">
+
+            <div class="control-group">
+                <label>Focus Box Size <span id="val-box" class="val-display">15%</span></label>
+                <input type="range" id="rng-box" min="5" max="50" value="15" oninput="document.getElementById('val-box').innerText = this.value + '%'" onchange="sendFocusBox(this.value)">
+            </div>
+            <div class="control-group">
+                <button class="tool-btn" onclick="fetch('/focus_reset', {method:'POST'})">Reset Best</button>
+                <button class="tool-btn" style="background: #666;" onclick="postFocus({clear:true})">Clear Focus Box</button>
             </div>
         </div>
     </div>
@@ -206,12 +250,13 @@ HTML_TEMPLATE = """
             let dragging = false, startX, startY, startPanX, startPanY;
 
             vp.addEventListener('pointerdown', (e) => {
-                if (zoomLevel <= 1.0) return;
-                dragging = true;
                 startX = e.clientX; startY = e.clientY;
                 startPanX = panX; startPanY = panY;
-                transformLayer.style.transition = 'none';
-                vp.setPointerCapture(e.pointerId);
+                dragging = zoomLevel > 1.0;
+                if (dragging) {
+                    transformLayer.style.transition = 'none';
+                    vp.setPointerCapture(e.pointerId);
+                }
             });
 
             vp.addEventListener('pointermove', (e) => {
@@ -222,14 +267,61 @@ HTML_TEMPLATE = """
                 applyTransform();
             });
 
-            function endDrag() {
-                if (!dragging) return;
-                dragging = false;
-                transformLayer.style.transition = '';
+            function endDrag(e) {
+                const moved = Math.hypot(e.clientX - startX, e.clientY - startY);
+                if (dragging) { dragging = false; transformLayer.style.transition = ''; }
+                if (moved < 6) placeFocusBox(e.clientX, e.clientY);
             }
             vp.addEventListener('pointerup', endDrag);
-            vp.addEventListener('pointercancel', endDrag);
+            vp.addEventListener('pointercancel', () => { dragging = false; transformLayer.style.transition = ''; });
         })();
+
+        // --- Focus metric ---
+        function postFocus(body) {
+            fetch('/focus_roi', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+        }
+        function placeFocusBox(cx, cy) {
+            const r = document.getElementById('video-feed').getBoundingClientRect();
+            const x = (cx - r.left) / r.width, y = (cy - r.top) / r.height;
+            if (x < 0 || x > 1 || y < 0 || y > 1) return;
+            postFocus({x: x, y: y});
+        }
+        function sendFocusBox(v) { postFocus({box: v / 100.0}); }
+
+        const sparkCanvas = document.getElementById('focus-spark');
+        const sparkCtx = sparkCanvas.getContext('2d');
+        function drawSpark(data, best) {
+            const w = sparkCanvas.width, h = sparkCanvas.height;
+            sparkCtx.clearRect(0, 0, w, h);
+            if (data.length < 2 || best <= 0) return;
+            sparkCtx.beginPath();
+            sparkCtx.strokeStyle = '#00e5ff';
+            sparkCtx.lineWidth = 2;
+            data.forEach((v, i) => {
+                const x = (i / (data.length - 1)) * w;
+                const y = h - (v / best) * (h - 2) - 1;
+                if (i === 0) sparkCtx.moveTo(x, y); else sparkCtx.lineTo(x, y);
+            });
+            sparkCtx.stroke();
+        }
+        function pollFocus() {
+            fetch('/focus').then(r => r.json()).then(d => {
+                const hint = document.getElementById('focus-hint');
+                if (!d.active) {
+                    document.getElementById('focus-pct').innerText = '--';
+                    document.getElementById('focus-bar-fill').style.width = '0';
+                    drawSpark([], 0);
+                    hint.innerText = 'Tap stream to place focus box';
+                    return;
+                }
+                const pct = d.best > 0 ? (100 * d.current / d.best) : 0;
+                document.getElementById('focus-pct').innerText = pct.toFixed(1) + '%';
+                document.getElementById('focus-bar-fill').style.width = Math.min(100, pct) + '%';
+                drawSpark(d.history, d.best);
+                hint.innerText = 'of best ' + d.best.toFixed(3) + '  (tap to move box)';
+            }).catch(() => {});
+        }
+        setInterval(pollFocus, 200);
 
         // Settings Logic
         let settings = {gain: 300, exp: 100};
@@ -277,6 +369,38 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
+
+# ================= FOCUS METRIC =================
+
+def focus_metric(gray):
+    """Exposure-normalized Tenengrad: mean squared Sobel gradient / mean intensity squared."""
+    g = gray.astype(np.float32)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    mean = max(float(g.mean()), 1.0)
+    return float(np.mean(gx * gx + gy * gy)) / (mean * mean)
+
+def focus_rect(center, box, w, h):
+    """Square box of side box*w centred on normalized (x,y), clamped inside frame."""
+    side = max(16, int(box * w))
+    rx = int(center['x'] * w - side / 2)
+    ry = int(center['y'] * h - side / 2)
+    rx = max(0, min(rx, w - side))
+    ry = max(0, min(ry, h - side))
+    return rx, ry, side, side
+
+def _selftest():
+    sharp = np.zeros((200, 200), np.uint8)
+    cv2.rectangle(sharp, (50, 50), (150, 150), 200, -1)
+    cv2.line(sharp, (0, 100), (200, 100), 90, 1)
+    blurred = cv2.GaussianBlur(sharp, (15, 15), 4)
+    s, b = focus_metric(sharp), focus_metric(blurred)
+    assert s > b * 2, (s, b)
+    dim = (sharp // 2).astype(np.uint8)
+    assert abs(focus_metric(dim) - s) / s < 0.05, (focus_metric(dim), s)
+    assert focus_rect({'x': 0.0, 'y': 1.0}, 0.1, 1000, 800) == (0, 700, 100, 100)
+    assert focus_rect({'x': 0.5, 'y': 0.5}, 0.1, 1000, 800) == (450, 350, 100, 100)
+    print("selftest ok", round(s, 3), round(b, 3))
 
 # ================= VIDEO LOOP =================
 
@@ -334,6 +458,21 @@ def generate_frames():
         if bayer_code is not None and frame.ndim == 2:
             frame = cv2.cvtColor(frame, bayer_code)
 
+        center = current_state['focus_center']
+        if center:
+            h, w = frame.shape[:2]
+            rx, ry, rw, rh = focus_rect(center, current_state['focus_box'], w, h)
+            crop = frame[ry:ry+rh, rx:rx+rw]
+            gray = crop[:, :, 1] if crop.ndim == 3 else crop
+            val = focus_metric(gray)
+            with state_lock:
+                focus_samples.append(val)
+                cur = float(np.median(focus_samples))
+                focus['current'] = cur
+                focus['best'] = max(focus['best'], cur)
+                focus_history.append(cur)
+            cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0) if frame.ndim == 3 else 255, 2)
+
         ret, buffer = cv2.imencode('.jpg', frame)
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
@@ -353,6 +492,31 @@ def update_settings():
         if 'exposure_mode' in d: cam_state['exposure_mode'] = str(d['exposure_mode'])
     return jsonify({"status":"ok"})
 
+@app.route('/focus_roi', methods=['POST'])
+def focus_roi():
+    d = request.json or {}
+    with state_lock:
+        if d.get('clear'):
+            cam_state['focus_center'] = None
+        elif 'x' in d:
+            cam_state['focus_center'] = {'x': float(d['x']), 'y': float(d['y'])}
+        if 'box' in d:
+            cam_state['focus_box'] = max(0.02, min(0.9, float(d['box'])))
+        _reset_focus()
+    return jsonify({"status":"ok"})
+
+@app.route('/focus_reset', methods=['POST'])
+def focus_reset():
+    with state_lock: _reset_focus()
+    return jsonify({"status":"ok"})
+
+@app.route('/focus')
+def focus_status():
+    with state_lock:
+        return jsonify({'active': cam_state['focus_center'] is not None,
+                        'current': focus['current'], 'best': focus['best'],
+                        'history': list(focus_history)})
+
 def _shutdown(signum, frame):
     print("\nShutting down...")
     try:
@@ -364,6 +528,9 @@ def _shutdown(signum, frame):
     os._exit(0)
 
 if __name__ == '__main__':
+    if '--selftest' in sys.argv:
+        _selftest()
+        sys.exit(0)
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
     app.run(host='0.0.0.0', port=5000, threaded=True)
