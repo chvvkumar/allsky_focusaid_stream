@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# ZWO ASI Camera Streamer (v13.1 - Fixed Auto-Star Selection)
+# ZWO ASI Camera Streamer (v14.0 - Debayered stream, focus metrics removed)
 # ==============================================================================
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v13.1)...${NC}"
+echo -e "${GREEN}Starting ZWO Camera Streamer Setup (v14.0)...${NC}"
 
 # --- 1. System Dependencies ---
 if ! dpkg -s libopencv-dev >/dev/null 2>&1; then
@@ -41,46 +41,46 @@ fi
 # --- 5. Generate Python Script ---
 cat << 'EOF' > zwo.py
 #!/usr/bin/env python3
-import sys, os, time, threading, json, math, signal
-from collections import deque
+import os, threading, signal
 import cv2
-import numpy as np
 import zwoasi as asi
 from flask import Flask, Response, render_template_string, request, jsonify
 
 # ================= CONFIGURATION =================
-LIB_FILE = './libASICamera2.so' 
+LIB_FILE = './libASICamera2.so'
 
 # Global State
 cam_state = {
     'gain': 300,
     'exposure_val': 100,
     'exposure_mode': 'ms',
-    'roi_norm': None,
-    'roi_selection_area': None,  # User-defined area for star selection
-    'font_scale': 1.0,      
-    'graph_height': 100,
-    'auto_select_pending': False     
 }
 state_lock = threading.Lock()
 
-# Focus History
-hfd_history = deque(maxlen=50)
-
 camera = None
-camera_lock = threading.Lock()
 app = Flask(__name__)
+
+# ZWO reports the Bayer pattern of the sensor's top-left 2x2 block.
+# OpenCV names its conversion by the 2x2 block starting at pixel (1,1),
+# so the mapping is deliberately "crossed".
+# Keys are ASI_BAYER_PATTERN enum values (zwoasi misnames 3 as ASI_BAYER_RB).
+BAYER_TO_CV = {
+    0: cv2.COLOR_BAYER_BG2BGR,  # ASI_BAYER_RG, sensor RGGB
+    1: cv2.COLOR_BAYER_RG2BGR,  # ASI_BAYER_BG, sensor BGGR
+    2: cv2.COLOR_BAYER_GB2BGR,  # ASI_BAYER_GR, sensor GRBG
+    3: cv2.COLOR_BAYER_GR2BGR,  # ASI_BAYER_GB, sensor GBRG
+}
 
 # ================= HTML TEMPLATE =================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>ZWO Smart Focus</title>
+    <title>ZWO Stream</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <style>
         body { font-family: -apple-system, sans-serif; background: #000; margin: 0; overflow: hidden; touch-action: none; }
-        
+
         #viewport { position: fixed; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; background: #111; overflow: hidden; }
         #transform-layer { position: relative; transform-origin: center center; transition: transform 0.1s ease-out; will-change: transform; }
         #video-feed { display: block; max-width: 100vw; max-height: 100vh; object-fit: contain; pointer-events: none; }
@@ -96,16 +96,16 @@ HTML_TEMPLATE = """
         #zoom-label { pointer-events: none; font-size: 11px; color: #d32f2f; font-weight: bold; font-family: monospace; background: rgba(20,20,20,0.9); border-radius: 10px; padding: 2px 8px; }
 
         #ui-layer { position: fixed; top: 10px; left: 10px; z-index: 100; width: 340px; max-width: 95vw; pointer-events: none; }
-        
-        .controls { 
+
+        .controls {
             pointer-events: auto; background: rgba(20, 20, 20, 0.9); backdrop-filter: blur(8px);
             padding: 15px; border-radius: 12px; color: #eee; border: 1px solid rgba(255,255,255,0.1);
             display: none; max-height: 85vh; overflow-y: auto;
         }
 
-        #toggle-btn { 
-            pointer-events: auto; background: rgba(211, 47, 47, 0.9); color: white; border: none; 
-            padding: 10px 15px; border-radius: 20px; font-weight: bold; cursor: pointer; 
+        #toggle-btn {
+            pointer-events: auto; background: rgba(211, 47, 47, 0.9); color: white; border: none;
+            padding: 10px 15px; border-radius: 20px; font-weight: bold; cursor: pointer;
         }
 
         .mode-switch { display: flex; background: #333; border-radius: 6px; margin-bottom: 15px; }
@@ -117,46 +117,6 @@ HTML_TEMPLATE = """
         .val-display { color: #d32f2f; font-weight: bold; font-family: monospace; }
         input[type=range] { width: 100%; height: 6px; background: #444; border-radius: 3px; -webkit-appearance: none; }
         input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; background: #d32f2f; border-radius: 50%; }
-        
-        .tool-btn { width: 100%; padding: 12px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; color: white; background: #0277bd; margin-top: 5px; }
-        .tool-btn:active { background: #01579b; }
-
-        /* History Graph Canvas */
-        #graph-container { background: #111; border: 1px solid #444; border-radius: 4px; margin-bottom: 15px; padding: 5px; }
-        canvas { width: 100%; height: 100px; display: block; }
-        
-        /* ROI Selection Overlay */
-        #roi-selection-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: 200;
-            display: none;
-            cursor: crosshair;
-        }
-        
-        #roi-rect {
-            position: absolute;
-            border: 2px dashed #ffeb3b;
-            background: rgba(255, 235, 59, 0.1);
-            pointer-events: none;
-        }
-        
-        #roi-hint {
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: rgba(0, 0, 0, 0.8);
-            color: #ffeb3b;
-            padding: 20px;
-            border-radius: 8px;
-            font-size: 16px;
-            pointer-events: none;
-            text-align: center;
-        }
     </style>
 </head>
 <body>
@@ -169,16 +129,11 @@ HTML_TEMPLATE = """
 
     <div id="ui-layer">
         <button id="toggle-btn" onclick="toggleUI()">Settings</button>
-        
+
         <div class="controls" id="control-panel">
             <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
                 <strong>CAMERA CONTROLS</strong>
                 <button onclick="toggleUI()" style="background:none; border:none; color:#fff; font-size:18px;">&times;</button>
-            </div>
-            
-            <div id="graph-container">
-                <div style="font-size:10px; color:#888; margin-bottom:2px;">Focus History</div>
-                <canvas id="historyGraph"></canvas>
             </div>
 
             <div class="control-group">
@@ -200,29 +155,9 @@ HTML_TEMPLATE = """
                 <label>Exposure Time <span id="val-exp" class="val-display">100</span></label>
                 <input type="range" id="rng-exp" min="1" max="5000" value="100" oninput="updateVal('exp', this.value)" onchange="sendSettings()">
             </div>
-            
-            <hr style="border-color: #333; margin: 15px 0;">
-
-            <div class="control-group">
-                <label>Overlay Text Size <span id="val-font" class="val-display">1.0</span></label>
-                <input type="range" id="rng-font" min="5" max="30" value="10" oninput="updateVal('font', this.value)" onchange="sendSettings()">
-            </div>
-
-            <div class="control-group">
-                <label>Graph Size <span id="val-gheight" class="val-display">100px</span></label>
-                <input type="range" id="rng-gheight" min="40" max="300" value="100" oninput="updateVal('gheight', this.value)" onchange="sendSettings()">
-            </div>
-            
-            <hr style="border-color: #333; margin: 15px 0;">
-            
-            <div class="control-group">
-                <button class="tool-btn" onclick="startROISelection()">📐 Select ROI Area</button>
-                <button class="tool-btn" onclick="triggerAutoSelect()">🎯 Auto-Select Star</button>
-                <button class="tool-btn" style="background: #666;" onclick="clearROI()">❌ Clear ROI & Selection</button>
-            </div>
         </div>
     </div>
-    
+
     <!-- Floating Zoom Controls -->
     <div id="zoom-controls">
         <button onclick="stepZoom(5)" title="Zoom in" aria-label="Zoom in">+</button>
@@ -231,64 +166,9 @@ HTML_TEMPLATE = """
         <button onclick="resetZoom()" title="Reset zoom" aria-label="Reset zoom" style="font-size:20px;">&#10227;</button>
     </div>
 
-    <!-- ROI Selection Overlay -->
-    <div id="roi-selection-overlay">
-        <div id="roi-hint">Click and drag to select ROI area<br><small>Press ESC to cancel</small></div>
-        <div id="roi-rect"></div>
-    </div>
-
     <script>
         const transformLayer = document.getElementById('transform-layer');
         let zoomLevel = 1.0;
-        
-        // --- Graphing Logic ---
-        const canvas = document.getElementById('historyGraph');
-        const ctx = canvas.getContext('2d');
-        
-        function drawGraph(data) {
-            canvas.width = canvas.offsetWidth;
-            canvas.height = canvas.offsetHeight;
-            const w = canvas.width;
-            const h = canvas.height;
-            ctx.clearRect(0, 0, w, h);
-            
-            if(data.length < 2) return;
-            
-            const maxVal = Math.max(...data);
-            const minVal = Math.min(...data); 
-            // Dynamic history scaling to show trends better
-            const range = maxVal - minVal;
-            const displayMin = range < 1.0 ? 0 : minVal * 0.9;
-            const displayMax = maxVal * 1.1;
-            const displayRange = displayMax - displayMin;
-            
-            ctx.beginPath();
-            ctx.strokeStyle = '#00e5ff';
-            ctx.lineWidth = 2;
-            
-            data.forEach((val, i) => {
-                const x = (i / (data.length - 1)) * w;
-                const y = h - (((val - displayMin) / displayRange) * h);
-                if (i===0) ctx.moveTo(x, y);
-                else ctx.lineTo(x, y);
-            });
-            ctx.stroke();
-            
-            ctx.font = '11px monospace';
-            ctx.fillStyle = '#fff';
-            ctx.textAlign = 'right';
-            ctx.fillText("Cur: " + data[data.length-1].toFixed(2), w - 5, 12);
-            ctx.fillStyle = '#0f0';
-            ctx.textAlign = 'left';
-            ctx.fillText("Min: " + minVal.toFixed(2), 5, h - 5);
-        }
-        
-        function fetchStatus() {
-            if(document.getElementById('control-panel').style.display === 'none') return;
-            fetch('/get_status').then(r => r.json()).then(d => { if(d.history) drawGraph(d.history); });
-        }
-        setInterval(fetchStatus, 1000);
-
         let panX = 0, panY = 0;
 
         function applyTransform() {
@@ -326,7 +206,7 @@ HTML_TEMPLATE = """
             let dragging = false, startX, startY, startPanX, startPanY;
 
             vp.addEventListener('pointerdown', (e) => {
-                if (zoomLevel <= 1.0 || roiSelectionActive) return;
+                if (zoomLevel <= 1.0) return;
                 dragging = true;
                 startX = e.clientX; startY = e.clientY;
                 startPanX = panX; startPanY = panY;
@@ -350,9 +230,9 @@ HTML_TEMPLATE = """
             vp.addEventListener('pointerup', endDrag);
             vp.addEventListener('pointercancel', endDrag);
         })();
-        
+
         // Settings Logic
-        let settings = {gain: 300, exp: 100, font: 10, gheight: 100};
+        let settings = {gain: 300, exp: 100};
         let expMode = 'ms';
 
         function toggleUI() {
@@ -361,7 +241,6 @@ HTML_TEMPLATE = """
             const show = p.style.display === 'none';
             p.style.display = show ? 'block' : 'none';
             b.style.display = show ? 'none' : 'block';
-            if(show) fetchStatus();
         }
 
         function setExpMode(m) {
@@ -369,20 +248,16 @@ HTML_TEMPLATE = """
             document.getElementById('mode-ms').classList.toggle('active', m==='ms');
             document.getElementById('mode-us').classList.toggle('active', m==='us');
             const rng = document.getElementById('rng-exp');
-            if(m === 'ms') { rng.max = 5000; rng.value = Math.max(1, rng.value); document.getElementById('val-exp').innerText = rng.value + ' ms'; } 
+            if(m === 'ms') { rng.max = 5000; rng.value = Math.max(1, rng.value); document.getElementById('val-exp').innerText = rng.value + ' ms'; }
             else { rng.max = 2000; rng.value = 100; document.getElementById('val-exp').innerText = rng.value + ' µs'; }
+            settings.exp = parseInt(rng.value);
             sendSettings();
         }
 
         function updateVal(k, v) {
-            if(k === 'font') document.getElementById('val-'+k).innerText = (v/10.0).toFixed(1);
-            else if(k === 'gheight') document.getElementById('val-'+k).innerText = v + 'px';
-            else document.getElementById('val-'+k).innerText = v + (k==='exp' ? (expMode==='ms'?' ms':' µs') : '');
-            
+            document.getElementById('val-'+k).innerText = v + (k==='exp' ? (expMode==='ms'?' ms':' µs') : '');
             if(k === 'gain') settings.gain = parseInt(v);
             if(k === 'exp') settings.exp = parseInt(v);
-            if(k === 'font') settings.font = parseInt(v);
-            if(k === 'gheight') settings.gheight = parseInt(v);
         }
 
         function sendSettings() {
@@ -390,497 +265,31 @@ HTML_TEMPLATE = """
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
-                    gain: settings.gain, 
+                    gain: settings.gain,
                     exposure_val: settings.exp,
-                    exposure_mode: expMode,
-                    font_scale: settings.font / 10.0,
-                    graph_height: settings.gheight
+                    exposure_mode: expMode
                 })
             });
         }
-        
-        function triggerAutoSelect() {
-            fetch('/trigger_auto_select', {method:'POST'});
-        }
-        
-        function clearROI() {
-            fetch('/clear_roi_area', {method:'POST'});
-            fetch('/update_roi', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({clear:true})});
-        }
-        
-        // ROI Selection Logic
-        let roiSelectionActive = false;
-        let roiStartX, roiStartY;
-        
-        function startROISelection() {
-            roiSelectionActive = true;
-            document.getElementById('roi-selection-overlay').style.display = 'block';
-            document.getElementById('control-panel').style.display = 'none';
-            document.getElementById('toggle-btn').style.display = 'block';
-        }
-        
-        function cancelROISelection() {
-            roiSelectionActive = false;
-            document.getElementById('roi-selection-overlay').style.display = 'none';
-            document.getElementById('roi-rect').style.display = 'none';
-        }
-        
-        const overlay = document.getElementById('roi-selection-overlay');
-        const roiRect = document.getElementById('roi-rect');
-        
-        overlay.addEventListener('mousedown', (e) => {
-            if (!roiSelectionActive) return;
-            document.getElementById('roi-hint').style.display = 'none';
-            roiStartX = e.clientX;
-            roiStartY = e.clientY;
-            roiRect.style.left = roiStartX + 'px';
-            roiRect.style.top = roiStartY + 'px';
-            roiRect.style.width = '0px';
-            roiRect.style.height = '0px';
-            roiRect.style.display = 'block';
-        });
-        
-        overlay.addEventListener('mousemove', (e) => {
-            if (!roiSelectionActive || !roiRect.style.display || roiRect.style.display === 'none') return;
-            const w = e.clientX - roiStartX;
-            const h = e.clientY - roiStartY;
-            if (w < 0) {
-                roiRect.style.left = e.clientX + 'px';
-                roiRect.style.width = (-w) + 'px';
-            } else {
-                roiRect.style.width = w + 'px';
-            }
-            if (h < 0) {
-                roiRect.style.top = e.clientY + 'px';
-                roiRect.style.height = (-h) + 'px';
-            } else {
-                roiRect.style.height = h + 'px';
-            }
-        });
-        
-        overlay.addEventListener('mouseup', (e) => {
-            if (!roiSelectionActive) return;
-            const endX = e.clientX;
-            const endY = e.clientY;
-            
-            // Get image dimensions
-            const img = document.getElementById('video-feed');
-            const imgRect = img.getBoundingClientRect();
-            
-            // Calculate normalized coordinates relative to image
-            const x1 = Math.min(roiStartX, endX) - imgRect.left;
-            const y1 = Math.min(roiStartY, endY) - imgRect.top;
-            const x2 = Math.max(roiStartX, endX) - imgRect.left;
-            const y2 = Math.max(roiStartY, endY) - imgRect.top;
-            
-            // Clamp to image bounds
-            const nx1 = Math.max(0, Math.min(x1, imgRect.width));
-            const ny1 = Math.max(0, Math.min(y1, imgRect.height));
-            const nx2 = Math.max(0, Math.min(x2, imgRect.width));
-            const ny2 = Math.max(0, Math.min(y2, imgRect.height));
-            
-            // Normalize to 0-1 range
-            const normX = nx1 / imgRect.width;
-            const normY = ny1 / imgRect.height;
-            const normW = (nx2 - nx1) / imgRect.width;
-            const normH = (ny2 - ny1) / imgRect.height;
-            
-            // Send to server if area is reasonable (at least 20x20 pixels)
-            if ((nx2 - nx1) > 20 && (ny2 - ny1) > 20) {
-                fetch('/set_roi_area', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({x: normX, y: normY, w: normW, h: normH})
-                });
-            }
-            
-            cancelROISelection();
-        });
-        
-        // Touch support for mobile
-        overlay.addEventListener('touchstart', (e) => {
-            if (!roiSelectionActive) return;
-            e.preventDefault();
-            const touch = e.touches[0];
-            document.getElementById('roi-hint').style.display = 'none';
-            roiStartX = touch.clientX;
-            roiStartY = touch.clientY;
-            roiRect.style.left = roiStartX + 'px';
-            roiRect.style.top = roiStartY + 'px';
-            roiRect.style.width = '0px';
-            roiRect.style.height = '0px';
-            roiRect.style.display = 'block';
-        });
-        
-        overlay.addEventListener('touchmove', (e) => {
-            if (!roiSelectionActive || !roiRect.style.display || roiRect.style.display === 'none') return;
-            e.preventDefault();
-            const touch = e.touches[0];
-            const w = touch.clientX - roiStartX;
-            const h = touch.clientY - roiStartY;
-            if (w < 0) {
-                roiRect.style.left = touch.clientX + 'px';
-                roiRect.style.width = (-w) + 'px';
-            } else {
-                roiRect.style.width = w + 'px';
-            }
-            if (h < 0) {
-                roiRect.style.top = touch.clientY + 'px';
-                roiRect.style.height = (-h) + 'px';
-            } else {
-                roiRect.style.height = h + 'px';
-            }
-        });
-        
-        overlay.addEventListener('touchend', (e) => {
-            if (!roiSelectionActive) return;
-            e.preventDefault();
-            const touch = e.changedTouches[0];
-            const endX = touch.clientX;
-            const endY = touch.clientY;
-            
-            const img = document.getElementById('video-feed');
-            const imgRect = img.getBoundingClientRect();
-            
-            const x1 = Math.min(roiStartX, endX) - imgRect.left;
-            const y1 = Math.min(roiStartY, endY) - imgRect.top;
-            const x2 = Math.max(roiStartX, endX) - imgRect.left;
-            const y2 = Math.max(roiStartY, endY) - imgRect.top;
-            
-            const nx1 = Math.max(0, Math.min(x1, imgRect.width));
-            const ny1 = Math.max(0, Math.min(y1, imgRect.height));
-            const nx2 = Math.max(0, Math.min(x2, imgRect.width));
-            const ny2 = Math.max(0, Math.min(y2, imgRect.height));
-            
-            const normX = nx1 / imgRect.width;
-            const normY = ny1 / imgRect.height;
-            const normW = (nx2 - nx1) / imgRect.width;
-            const normH = (ny2 - ny1) / imgRect.height;
-            
-            if ((nx2 - nx1) > 20 && (ny2 - ny1) > 20) {
-                fetch('/set_roi_area', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({x: normX, y: normY, w: normW, h: normH})
-                });
-            }
-            
-            cancelROISelection();
-        });
-        
-        // ESC key to cancel
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && roiSelectionActive) {
-                cancelROISelection();
-            }
-        });
-        
+
         document.getElementById('control-panel').style.display = 'none';
     </script>
 </body>
 </html>
 """
 
-# ================= PROCESSING ALGORITHMS =================
-
-def calculate_hfd(roi_img):
-    try:
-        blurred = cv2.GaussianBlur(roi_img, (3, 3), 0)
-        minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(blurred)
-        
-        if maxVal < 5: return 0.0, maxLoc, maxLoc
-
-        bg = np.median(roi_img)
-        star_data = roi_img.astype(float) - bg
-        
-        # --- FIX: ROBUST NOISE GATE ---
-        # 1. Clip negative values (where pixel < background)
-        star_data[star_data < 0] = 0
-        
-        # 2. Dynamic Threshold + Hard Floor
-        rel_thresh = (maxVal - bg) * 0.2
-        abs_thresh = 10.0 
-        threshold = max(rel_thresh, abs_thresh)
-        
-        star_data[star_data < threshold] = 0
-        
-        m = cv2.moments(star_data)
-        if m['m00'] == 0: return 0.0, maxLoc, maxLoc
-        cx = m['m10'] / m['m00']
-        cy = m['m01'] / m['m00']
-        
-        h, w = roi_img.shape
-        y_indices, x_indices = np.indices((h, w))
-        distances = np.sqrt((x_indices - cx)**2 + (y_indices - cy)**2)
-        
-        total_flux = np.sum(star_data)
-        weighted_flux = np.sum(star_data * distances)
-        
-        if total_flux == 0: return 0.0, (cx, cy), maxLoc
-        return round((weighted_flux / total_flux) * 2.0, 2), (cx, cy), maxLoc
-    except:
-        return 0.0, (0,0), (0,0)
-
-def draw_overlays(frame, roi_img, hfd_val, centroid, peak_coords, rect_offset, state):
-    rx, ry, rw, rh = rect_offset
-    # Graph Scaling
-    g_h = state.get('graph_height', 100)
-    g_w = int(g_h * 1.5)
-    
-    # Box Collision & Centering
-    img_h, img_w, _ = frame.shape
-    g_x = rx + (rw // 2) - (g_w // 2)
-    g_x = max(0, min(g_x, img_w - g_w))
-    g_y = ry + rh + 5
-    if g_y + g_h > img_h:
-        g_y = ry - 5 - g_h
-        if g_y < 0: g_y = 0
-
-    # Draw ROI Box & HFD
-    font_s = state.get('font_scale', 1.0)
-    cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
-    label = f"HFD: {hfd_val:.2f}"
-    thickness = 2
-    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_s, thickness)
-    cv2.rectangle(frame, (rx, ry-th-6), (rx+tw+6, ry), (0, 0, 0), -1)
-    cv2.putText(frame, label, (rx+3, ry-5), cv2.FONT_HERSHEY_SIMPLEX, font_s, (0, 255, 0), thickness)
-
-    # GRAPH DRAWING
-    iy = int(peak_coords[1])
-    
-    if iy >= 0 and iy < roi_img.shape[0]:
-        row_data = roi_img[iy, :]
-        
-        # Black Background
-        cv2.rectangle(frame, (g_x, g_y), (g_x+g_w, g_y+g_h), (0,0,0), -1)
-        cv2.rectangle(frame, (g_x, g_y), (g_x+g_w, g_y+g_h), (50,50,50), 1)
-        
-        r_min, r_max = np.min(row_data), np.max(row_data)
-        r_range = r_max - r_min
-        NOISE_THRESHOLD = 15
-        
-        pts = []
-        for x, val in enumerate(row_data):
-            px = int(g_x + (x / len(row_data)) * g_w)
-            if r_range > NOISE_THRESHOLD:
-                norm_h = (val - r_min) / r_range
-                py = int((g_y + g_h) - (norm_h * g_h))
-            else:
-                norm_h = val / 255.0 
-                py = int((g_y + g_h) - (norm_h * g_h))
-            pts.append((px, py))
-            
-        if len(pts) > 1:
-            color = (0, 255, 255) if r_range > NOISE_THRESHOLD else (255, 100, 0)
-            cv2.polylines(frame, [np.array(pts)], False, color, 1)
-        
-        lbl = "Profile" if r_range > NOISE_THRESHOLD else "Noise"
-        cv2.putText(frame, lbl, (g_x+2, g_y+12), cv2.FONT_HERSHEY_PLAIN, 0.8, (150,150,150), 1)
-
-def auto_select_star(frame, target_us, roi_area=None):
-    """Perform star auto-selection with enhanced validation to ensure actual stars are selected"""
-    # Detect star on full frame or within specified ROI area
-    if len(frame.shape)==3: gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    else: gray = frame
-    
-    h, w = gray.shape
-    
-    # If ROI area is specified, limit search to that area
-    search_gray = gray
-    offset_x, offset_y = 0, 0
-    
-    if roi_area:
-        rx = int(roi_area['x'] * w)
-        ry = int(roi_area['y'] * h)
-        rw = int(roi_area['w'] * w)
-        rh = int(roi_area['h'] * h)
-        
-        # Validate ROI bounds
-        if rw > 10 and rh > 10 and rx >= 0 and ry >= 0 and rx + rw <= w and ry + rh <= h:
-            search_gray = gray[ry:ry+rh, rx:rx+rw]
-            offset_x, offset_y = rx, ry
-            h, w = search_gray.shape
-        else:
-            roi_area = None  # Invalid ROI, search full frame
-    
-    # 1. Blur to suppress hot pixels (High frequency noise)
-    blurred = cv2.GaussianBlur(search_gray, (9, 9), 2)
-    
-    # 2. IMPROVED Dynamic Thresholding
-    mean_val, std_val = cv2.meanStdDev(blurred)
-    mean_val = mean_val[0][0]
-    std_val = std_val[0][0]
-    
-    # Use percentile-based threshold for better robustness across different exposures
-    sorted_pixels = np.sort(blurred.flatten())
-    p99 = sorted_pixels[int(len(sorted_pixels) * 0.99)]
-    p95 = sorted_pixels[int(len(sorted_pixels) * 0.95)]
-    
-    # Adaptive threshold combining multiple methods
-    stat_thresh = mean_val + 3.5 * std_val
-    perc_thresh = p95 + (p99 - p95) * 0.3
-    thresh_val = max(stat_thresh, perc_thresh, mean_val + 12)
-    
-    _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
-    
-    # 3. Find Contours
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    candidates = []
-    center_x, center_y = w // 2, h // 2
-    
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < 4 or area > 5000: continue  # Filter noise and over-exposed regions
-        
-        x, y, bw, bh = cv2.boundingRect(c)
-        
-        # Filter out edge artifacts
-        if x < 10 or y < 10 or (x+bw) > w-10 or (y+bh) > h-10: continue
-        
-        # Check aspect ratio - stars should be roughly circular
-        aspect_ratio = max(bw, bh) / max(min(bw, bh), 1)
-        if aspect_ratio > 3.0: continue  # Too elongated
-        
-        # Extract small region around candidate
-        cx = int(x + bw/2)
-        cy = int(y + bh/2)
-        
-        # Create test ROI (larger than contour to test PSF)
-        test_size = max(bw, bh) * 3
-        test_size = min(int(test_size), 64)  # Cap at 64 pixels
-        tx = max(0, int(cx - test_size // 2))
-        ty = max(0, int(cy - test_size // 2))
-        test_size = min(test_size, w - tx, h - ty)
-        
-        if test_size < 8: continue
-        
-        test_roi = search_gray[ty:ty+test_size, tx:tx+test_size]
-        
-        # STAR VALIDATION - Check for proper PSF characteristics
-        # A real star should have:
-        # 1. Clear peak brightness
-        # 2. Gradual falloff from center
-        # 3. Not be a saturated blob
-        
-        roi_min, roi_max, roi_minLoc, roi_maxLoc = cv2.minMaxLoc(test_roi)
-        roi_mean = np.mean(test_roi)
-        
-        # Check if too saturated (likely over-exposed or hot pixel)
-        if roi_max >= 250:
-            continue
-        
-        # Check dynamic range (stars should have good contrast)
-        dynamic_range = roi_max - roi_mean
-        if dynamic_range < 15:
-            continue
-        
-        # Check peak position (should be relatively centered in the test ROI)
-        peak_x_offset = abs(roi_maxLoc[0] - test_size/2) / (test_size/2)
-        peak_y_offset = abs(roi_maxLoc[1] - test_size/2) / (test_size/2)
-        if peak_x_offset > 0.6 or peak_y_offset > 0.6:
-            continue
-        
-        # Calculate gradient falloff (stars should have smooth gradient)
-        bg_estimate = np.median(test_roi)
-        above_bg = test_roi.astype(float) - bg_estimate
-        above_bg[above_bg < 0] = 0
-        
-        # Check if there's a concentrated bright region
-        bright_pixels = np.sum(above_bg > dynamic_range * 0.5)
-        if bright_pixels < 3 or bright_pixels > test_size * test_size * 0.3:
-            continue
-        
-        # Circularity bonus
-        circularity = 1.0 / aspect_ratio
-        
-        # Distance from center penalty
-        dist_from_center = math.hypot(cx - center_x, cy - center_y)
-        
-        # Combined score favoring:
-        # - Good dynamic range
-        # - Reasonable size
-        # - Circular shape
-        # - Central location
-        score = (dynamic_range * 0.5 + area * 0.1) * circularity / (1.0 + dist_from_center * 0.003)
-        
-        candidates.append({
-            'pos': (cx, cy),
-            'score': score,
-            'area': area,
-            'dynamic_range': dynamic_range
-        })
-    
-    # 4. Select best candidate
-    best_star = None
-    if candidates:
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-        # Adjust coordinates back to full frame if using ROI area
-        cx, cy = candidates[0]['pos']
-        best_star = (cx + offset_x, cy + offset_y)
-    
-    # 5. VALIDATED Fallback - only if we find something star-like
-    if best_star is None:
-        # Try to find the brightest well-behaved region
-        minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(blurred)
-        
-        # Extract region around brightest pixel
-        test_size = 32
-        tx = max(0, int(maxLoc[0] - test_size // 2))
-        ty = max(0, int(maxLoc[1] - test_size // 2))
-        tx = min(tx, w - test_size)
-        ty = min(ty, h - test_size)
-        
-        if tx >= 0 and ty >= 0:
-            test_roi = search_gray[ty:ty+test_size, tx:tx+test_size]
-            roi_mean = np.mean(test_roi)
-            
-            # Only use if it's:
-            # 1. Significantly brighter than mean
-            # 2. Not saturated
-            # 3. Has reasonable dynamic range
-            brightness_ratio = maxVal / max(mean_val, 1)
-            dynamic_range = maxVal - roi_mean
-            
-            if brightness_ratio > 1.5 and maxVal < 250 and dynamic_range > 20:
-                # Adjust for ROI offset
-                best_star = (maxLoc[0] + offset_x, maxLoc[1] + offset_y)
-    
-    # 6. Apply ROI if star found
-    if best_star:
-        cx, cy = best_star
-        roi_size = 128  # Fixed ROI size
-        
-        # Get original frame dimensions
-        if len(frame.shape) == 3:
-            orig_h, orig_w, _ = frame.shape
-        else:
-            orig_h, orig_w = frame.shape
-        
-        nx = int(cx - roi_size // 2)
-        ny = int(cy - roi_size // 2)
-        
-        # Clamp to bounds of original frame
-        nx = max(0, min(nx, orig_w - roi_size))
-        ny = max(0, min(ny, orig_h - roi_size))
-        
-        return {
-            'x': nx/orig_w, 'y': ny/orig_h, 
-            'w': roi_size/orig_w, 'h': roi_size/orig_h
-        }
-    
-    return None
-
 # ================= VIDEO LOOP =================
 
 def generate_frames():
     global camera
+    bayer_code = None
     if not camera:
         try:
             asi.init(LIB_FILE)
             if asi.get_num_cameras() > 0:
                 camera = asi.Camera(0)
                 camera.set_control_value(asi.ASI_HIGH_SPEED_MODE, 1)
+                camera.set_image_type(asi.ASI_IMG_RAW8)
                 camera.start_video_capture()
         except: pass
 
@@ -888,84 +297,44 @@ def generate_frames():
         yield b'Error: No Camera'
         return
 
+    props = camera.get_camera_property()
+    if props.get('IsColorCam'):
+        bayer_code = BAYER_TO_CV.get(props.get('BayerPattern'), cv2.COLOR_BAYER_BG2BGR)
+
     applied_gain = -1
     applied_exp = -1
-    frames_since_exp_change = 0
 
     while True:
         with state_lock:
             current_state = cam_state.copy()
-            
+
         gain = current_state['gain']
         exp_val = current_state['exposure_val']
         exp_mode = current_state['exposure_mode']
-        roi_def = current_state['roi_norm']
-        auto_select = current_state.get('auto_select_pending', False)
-        
+
         try:
             if gain != applied_gain:
                 camera.set_control_value(asi.ASI_GAIN, gain)
                 applied_gain = gain
-            
+
             target_us = exp_val * 1000 if exp_mode == 'ms' else exp_val
             target_us = max(1, target_us)
-            
+
             if target_us != applied_exp:
                 camera.set_control_value(asi.ASI_EXPOSURE, target_us)
                 applied_exp = target_us
-                frames_since_exp_change = 0  # Reset counter
-            else:
-                frames_since_exp_change += 1
         except: pass
 
         try:
             to_ms = int(target_us / 1000) + 500
             frame = camera.capture_video_frame(timeout=to_ms)
         except: continue
-        
-        if len(frame.shape) == 2:
-            color_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-        else:
-            color_frame = cv2.cvtColor(frame, cv2.COLOR_BAYER_RG2RGB)
 
-        # --- AUTO STAR SELECTION ---
-        # Only perform auto-selection after camera has stabilized (wait 3 frames)
-        if auto_select and frames_since_exp_change >= 3:
-            roi_selection_area = current_state.get('roi_selection_area')
-            result = auto_select_star(frame, target_us, roi_selection_area)
-            with state_lock:
-                cam_state['roi_norm'] = result
-                cam_state['auto_select_pending'] = False
-            roi_def = result
+        # RAW8 frame is a 2D Bayer mosaic on colour cameras; debayer to BGR for JPEG.
+        if bayer_code is not None and frame.ndim == 2:
+            frame = cv2.cvtColor(frame, bayer_code)
 
-        # --- DRAW ROI SELECTION AREA ---
-        roi_selection_area = current_state.get('roi_selection_area')
-        if roi_selection_area:
-            h, w, _ = color_frame.shape
-            sx = int(roi_selection_area['x'] * w)
-            sy = int(roi_selection_area['y'] * h)
-            sw = int(roi_selection_area['w'] * w)
-            sh = int(roi_selection_area['h'] * h)
-            # Draw yellow dashed rectangle for selection area
-            cv2.rectangle(color_frame, (sx, sy), (sx+sw, sy+sh), (0, 255, 255), 2)
-            cv2.putText(color_frame, "Selection Area", (sx+3, sy+15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        
-        # --- ROI PROCESSING ---
-        if roi_def:
-            h, w, _ = color_frame.shape
-            rx = int(roi_def['x'] * w)
-            ry = int(roi_def['y'] * h)
-            rw = int(roi_def['w'] * w)
-            rh = int(roi_def['h'] * h)
-            
-            if rw > 10 and rh > 10 and rx+rw < w and ry+rh < h:
-                roi_gray = frame[ry:ry+rh, rx:rx+rw] if len(frame.shape)==2 else cv2.cvtColor(color_frame[ry:ry+rh, rx:rx+rw], cv2.COLOR_RGB2GRAY)
-                hfd, cent, peak = calculate_hfd(roi_gray)
-                hfd_history.append(hfd)
-                draw_overlays(color_frame, roi_gray, hfd, cent, peak, (rx, ry, rw, rh), current_state)
-
-        ret, buffer = cv2.imencode('.jpg', color_frame)
+        ret, buffer = cv2.imencode('.jpg', frame)
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
 # ================= ROUTES =================
@@ -975,9 +344,6 @@ def index(): return render_template_string(HTML_TEMPLATE)
 @app.route('/video_feed')
 def video_feed(): return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-@app.route('/get_status')
-def get_status(): return jsonify({'history': list(hfd_history)})
-
 @app.route('/update_settings', methods=['POST'])
 def update_settings():
     d = request.json
@@ -985,44 +351,6 @@ def update_settings():
         if 'gain' in d: cam_state['gain'] = int(d['gain'])
         if 'exposure_val' in d: cam_state['exposure_val'] = int(d['exposure_val'])
         if 'exposure_mode' in d: cam_state['exposure_mode'] = str(d['exposure_mode'])
-        if 'font_scale' in d: cam_state['font_scale'] = float(d['font_scale'])
-        if 'graph_height' in d: cam_state['graph_height'] = int(d['graph_height'])
-    return jsonify({"status":"ok"})
-
-@app.route('/trigger_auto_select', methods=['POST'])
-def trigger_auto_select():
-    with state_lock:
-        cam_state['roi_norm'] = None
-        cam_state['auto_select_pending'] = True
-    return jsonify({"status":"ok"})
-
-@app.route('/update_roi', methods=['POST'])
-def update_roi():
-    d = request.json
-    with state_lock:
-        if 'clear' in d: 
-            cam_state['roi_norm'] = None
-            cam_state['auto_select_pending'] = False
-        else: cam_state['roi_norm'] = {
-            'x': float(d['x']), 'y': float(d['y']),
-            'w': float(d['w']), 'h': float(d['h'])
-        }
-    return jsonify({"status":"ok"})
-
-@app.route('/set_roi_area', methods=['POST'])
-def set_roi_area():
-    d = request.json
-    with state_lock:
-        cam_state['roi_selection_area'] = {
-            'x': float(d['x']), 'y': float(d['y']),
-            'w': float(d['w']), 'h': float(d['h'])
-        }
-    return jsonify({"status":"ok"})
-
-@app.route('/clear_roi_area', methods=['POST'])
-def clear_roi_area():
-    with state_lock:
-        cam_state['roi_selection_area'] = None
     return jsonify({"status":"ok"})
 
 def _shutdown(signum, frame):
